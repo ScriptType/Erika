@@ -10,8 +10,8 @@ use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2_core_foundation::CFRetained;
 use objc2_core_foundation::CGSize;
 use objc2_core_graphics::{
-    CGColorSpace, kCGColorSpaceDisplayP3_PQ, kCGColorSpaceExtendedLinearSRGB,
-    kCGColorSpaceITUR_2100_PQ, kCGColorSpaceSRGB,
+    CGColorSpace, kCGColorSpaceDisplayP3_PQ, kCGColorSpaceExtendedLinearDisplayP3,
+    kCGColorSpaceExtendedLinearSRGB, kCGColorSpaceITUR_2100_PQ, kCGColorSpaceSRGB,
 };
 use objc2_core_video::kCVReturnSuccess;
 use objc2_core_video::{
@@ -26,7 +26,8 @@ use objc2_core_video::{
     kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
 };
 use objc2_core_video::{
-    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    kCVPixelFormatType_64RGBAHalf, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
 };
 use objc2_foundation::NSString;
 use objc2_metal::{
@@ -360,6 +361,15 @@ impl MetalRendererImpl {
             drawable_count,
             output_mode_switches: self.stats.output_mode_switches,
             ..RendererResourceStats::default()
+        }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+    pub fn shared_headroom(&mut self, headroom: f32) {
+        // No resource-format change: this adapter always renders RGBA16F.
+        if headroom.is_finite() {
+            self.requested_output_mode = MetalOutputMode::apple_edr(headroom.max(1.0));
+            self.output_mode = self.requested_output_mode;
         }
     }
 
@@ -717,7 +727,7 @@ impl MetalRendererImpl {
                 "imported video frame has no luma plane".to_string(),
             ));
         };
-        let Some(chroma) = textures.chroma_texture() else {
+        let Some(chroma) = textures.chroma_texture().or(Some(luma)) else {
             return Err(PlayerError::Renderer(
                 "imported video frame has no chroma plane".to_string(),
             ));
@@ -726,7 +736,18 @@ impl MetalRendererImpl {
         let source_color = frame.pipeline.source;
         self.select_output_mode_for_source(source_color);
         if let Some(layer) = self.layer.as_ref().cloned() {
-            self.configure_layer_source_color(&layer, source_color);
+            if matches!(frame.frame.info.format, ImportedVideoFormat::Rgba16Float) {
+                if self.layer_color_space_label != "extended-linear-display-p3-shared-hdr" {
+                    if let Some(space) = CGColorSpace::with_name(Some(unsafe {
+                        kCGColorSpaceExtendedLinearDisplayP3
+                    })) {
+                        layer.setColorspace(Some(&space));
+                    }
+                    self.layer_color_space_label = "extended-linear-display-p3-shared-hdr";
+                }
+            } else {
+                self.configure_layer_source_color(&layer, source_color);
+            }
         }
         frame.pipeline = frame
             .pipeline
@@ -760,12 +781,11 @@ impl MetalRendererImpl {
         self.collect_gpu_timing();
         self.stats.last_upscaler_encode_duration = Duration::ZERO;
 
-        let logical_width = self
-            .video_alpha_mode
-            .logical_width(frame.frame.info.width as u32);
+        let (_, _, geometry_width, geometry_height) = frame.frame.shared_geometry();
+        let logical_width = self.video_alpha_mode.logical_width(geometry_width);
         let layout = VideoPresentationLayout::aspect_fit(
             logical_width,
-            frame.frame.info.height as u32,
+            geometry_height,
             self.stats.drawable_width,
             self.stats.drawable_height,
         );
@@ -863,7 +883,8 @@ impl MetalRendererImpl {
                 tone_map: tone_map_code(frame.pipeline.tone_map.operator),
                 edr_output: self.output_mode.is_edr() as u32,
                 _reserved0: self.video_alpha_mode as u32,
-                _reserved1: 0,
+                _reserved1: matches!(frame.frame.info.format, ImportedVideoFormat::Rgba16Float)
+                    as u32,
                 rect: layout.target_rect,
                 viewport: layout.video_viewport(),
                 nits: [
@@ -874,6 +895,8 @@ impl MetalRendererImpl {
                 ],
                 luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
                 gamut_matrix_rows: frame.pipeline.gamut_matrix().row4s(),
+                source_rect: frame.frame.shared_geometry().0,
+                source_rotation: frame.frame.shared_geometry().1,
             };
             encoder.setRenderPipelineState(&pipeline);
             encoder.setFragmentTexture_atIndex(Some(luma), 0);
@@ -920,6 +943,29 @@ impl MetalRendererImpl {
                 let drawable_ref: &ProtocolObject<dyn MTLDrawable> =
                     ProtocolObject::from_ref(&**drawable);
                 command_buffer.presentDrawable(drawable_ref);
+            }
+            #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+            if let Some(owner) = frame.frame.shared_owner.as_ref().cloned() {
+                if let Some(drawable) = &drawable {
+                    let presented_owner = owner.clone();
+                    let clock = owner.presentation_clock();
+                    let submitted = crate::shared_hdr::EngineOutput::host_time();
+                    let callback = block2::RcBlock::new(
+                        move |drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| {
+                            let host = drawable.as_ref().presentedTime();
+                            let pts = presented_owner.info.pts_value as f64
+                                / presented_owner.info.pts_scale as f64;
+                            presented_owner.presented(host, pts - clock - (host - submitted));
+                        },
+                    );
+                    drawable.addPresentedHandler(&*callback as *const _ as *mut _);
+                }
+                let callback = block2::RcBlock::new(
+                    move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                        let _keep_alive = &owner;
+                    },
+                );
+                command_buffer.addCompletedHandler(&*callback as *const _ as *mut _);
             }
             command_buffer.commit();
             if drawable.is_none() {
@@ -988,7 +1034,7 @@ impl MetalRendererImpl {
                 "imported video frame has no luma plane".to_string(),
             ));
         };
-        let Some(chroma) = textures.chroma_texture() else {
+        let Some(chroma) = textures.chroma_texture().or(Some(luma)) else {
             return Err(PlayerError::Renderer(
                 "imported video frame has no chroma plane".to_string(),
             ));
@@ -1060,7 +1106,8 @@ impl MetalRendererImpl {
                 tone_map: tone_map_code(frame.pipeline.tone_map.operator),
                 edr_output: self.output_mode.is_edr() as u32,
                 _reserved0: 0,
-                _reserved1: 0,
+                _reserved1: matches!(frame.frame.info.format, ImportedVideoFormat::Rgba16Float)
+                    as u32,
                 rect: layout.target_rect,
                 viewport: layout.video_viewport(),
                 nits: [
@@ -1071,6 +1118,8 @@ impl MetalRendererImpl {
                 ],
                 luma_coefficients: luma_coefficients(frame.pipeline.luma_coefficients()),
                 gamut_matrix_rows: frame.pipeline.gamut_matrix().row4s(),
+                source_rect: frame.frame.shared_geometry().0,
+                source_rotation: frame.frame.shared_geometry().1,
             };
             encoder.setRenderPipelineState(&pipeline);
             encoder.setFragmentTexture_atIndex(Some(luma), 0);
@@ -1697,6 +1746,40 @@ impl MetalRendererImpl {
             )
         };
         let pixel_format = CVPixelBufferGetPixelFormatType(pixel_buffer);
+        if pixel_format == kCVPixelFormatType_64RGBAHalf {
+            let width = CVPixelBufferGetWidth(pixel_buffer);
+            let height = CVPixelBufferGetHeight(pixel_buffer);
+            let cache = self.texture_cache()?;
+            let image = unsafe { &*(source.raw_pixel_buffer.cast::<CVImageBuffer>()) };
+            let cv_texture =
+                create_plane_texture(cache, image, MTLPixelFormat::RGBA16Float, width, height, 0)?;
+            let texture = CVMetalTextureGetTexture(&cv_texture)
+                .ok_or_else(|| PlayerError::Renderer("RGBA16F CV texture unavailable".into()))?;
+            return Ok(ImportedVideoFrameResult {
+                info: ImportedVideoFrameInfo {
+                    width,
+                    height,
+                    pixel_format,
+                    pixel_format_fourcc: fourcc_string(pixel_format),
+                    format: ImportedVideoFormat::Rgba16Float,
+                    full_range: true,
+                    color_range: ColorRange::Full,
+                    planes: vec![ImportedVideoPlaneInfo {
+                        index: 0,
+                        width,
+                        height,
+                        metal_pixel_format: "RGBA16Float",
+                    }],
+                },
+                textures: ImportedVideoFrameTextures {
+                    source_pixel_buffer: Some(retained_pixel_buffer),
+                    planes: vec![ImportedVideoPlaneTexture {
+                        cv_texture: Some(cv_texture),
+                        metal_texture: texture,
+                    }],
+                },
+            });
+        }
         let mapping =
             PixelBufferMapping::from_core_video_format(pixel_format).ok_or_else(|| {
                 PlayerError::Renderer(format!(
@@ -1824,6 +1907,7 @@ impl MetalRendererImpl {
                 pixel_format_fourcc: match format {
                     ImportedVideoFormat::Nv12 => "NV12",
                     ImportedVideoFormat::P010 => "P010",
+                    ImportedVideoFormat::Rgba16Float => "RGBA16Float",
                 }
                 .to_string(),
                 format,
@@ -2160,6 +2244,8 @@ struct VideoUniforms {
     nits: [f32; 4],
     luma_coefficients: [f32; 4],
     gamut_matrix_rows: [[f32; 4]; 3],
+    source_rect: [f32; 4],
+    source_rotation: [f32; 4],
 }
 
 fn metal_pixel_format(format: MetalDrawablePixelFormat) -> MTLPixelFormat {
@@ -2792,6 +2878,8 @@ struct VideoUniforms {
     float4 nits;
     float4 luma_coefficients;
     float4 gamut_matrix_rows[3];
+    float4 source_rect;
+    float4 source_rotation;
 };
 
 float source_peak_nits(constant VideoUniforms& uniforms) {
@@ -3016,6 +3104,20 @@ fragment float4 erika_video_fragment(
     texture2d<float, access::sample> chroma_texture [[texture(1)]],
     sampler video_sampler [[sampler(0)]],
     constant VideoUniforms& uniforms [[buffer(0)]]) {
+    if (uniforms.reserved1 != 0) {
+        float2 q = in.tex_coord - 0.5;
+        float2 uv = float2(dot(uniforms.source_rotation.xy,q),dot(uniforms.source_rotation.zw,q)) + 0.5;
+        if (any(uv < 0.0) || any(uv > 1.0)) return float4(0,0,0,1);
+        uv = uniforms.source_rect.xy + uv * uniforms.source_rect.zw;
+        float3 bt2020 = luma_texture.sample(video_sampler, uv).rgb / source_reference_white_nits(uniforms);
+        float3 rgb = float3(dot(bt2020,float3(1.3435783,-0.2821797,-0.0613986)),
+                            dot(bt2020,float3(-0.0652975,1.0757879,-0.0104905)),
+                            dot(bt2020,float3(0.0028218,-0.0195985,1.0167767)));
+        float headroom = max(1.0, target_peak_nits(uniforms)/target_reference_white_nits(uniforms));
+        float knee = min(1.0,0.75*headroom), peak = max(rgb.r,max(rgb.g,rgb.b));
+        if (peak > knee) rgb *= (knee+(headroom-knee)*(1.0-exp(-(peak-knee)/(headroom-knee))))/peak;
+        return float4(rgb,1.0);
+    }
     bool packed_alpha = uniforms.video_alpha_mode == 1;
     float2 color_coord = packed_alpha
         ? float2(in.tex_coord.x * 0.5, in.tex_coord.y)
@@ -3626,7 +3728,7 @@ mod tests {
 
     #[test]
     fn video_uniforms_keep_float4_fields_aligned() {
-        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 144);
+        assert_eq!(std::mem::size_of::<super::VideoUniforms>(), 176);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, edr_output), 20);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, rect), 32);
         assert_eq!(std::mem::offset_of!(super::VideoUniforms, viewport), 48);

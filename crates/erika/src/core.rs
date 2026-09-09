@@ -751,6 +751,24 @@ impl FlutterTextureHandle {
 }
 
 pub trait RendererBackend {
+    fn set_source_identity(&mut self, _source: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Process teardown may need multiple nonblocking ticks to drain async GPU workers.
+    fn prepare_shutdown(&mut self) -> bool {
+        true
+    }
+
+    /// Asynchronous adapters invalidate completed output before presentation on seeks.
+    fn begin_playback_generation(
+        &mut self,
+        _generation: u64,
+        _clock_seconds: Option<f64>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     fn attach_surface(&mut self, surface: PlatformSurface) -> Result<()>;
     fn detach_surface(&mut self) -> Result<()>;
     fn resize_surface(&mut self, metrics: SurfaceMetrics) -> Result<()>;

@@ -30,6 +30,8 @@ struct DemoState {
     presenter: PresenterRuntime,
     load_attempted: bool,
     overlay_logged: bool,
+    adapter_seek_done: bool,
+    shutting_down: bool,
 }
 
 impl DemoState {
@@ -44,10 +46,15 @@ impl DemoState {
             })?,
             load_attempted: false,
             overlay_logged: false,
+            adapter_seek_done: false,
+            shutting_down: false,
         })
     }
 
     fn render(&mut self, time_seconds: f64) {
+        if self.shutting_down {
+            return;
+        }
         if !self.load_attempted {
             self.load_attempted = true;
             if let Some(uri) = MEDIA_URI.get() {
@@ -76,6 +83,24 @@ impl DemoState {
             }
         }
 
+        if !self.adapter_seek_done {
+            if let Ok(at) = env::var("ERIKA_ADAPTER_SEEK_AT")
+                .unwrap_or_default()
+                .parse::<f64>()
+            {
+                if time_seconds >= at {
+                    self.adapter_seek_done = true;
+                    let target = env::var("ERIKA_ADAPTER_SEEK_TO")
+                        .unwrap_or_else(|_| "0.25".into())
+                        .parse::<f64>()
+                        .unwrap_or(0.25);
+                    self.seek_seconds(target);
+                    eprintln!(
+                        "Erika adapter scripted seek: host={time_seconds:.3} target={target:.3}"
+                    );
+                }
+            }
+        }
         match self.presenter.render_tick(time_seconds) {
             Ok(stats) => {
                 if !self.overlay_logged && stats.overlay_frames > 0 {
@@ -174,6 +199,27 @@ pub extern "C" fn erika_demo_resize_layer(width: u32, height: u32, scale: f64) {
         {
             eprintln!("Erika demo resize failed: {error}");
         }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn erika_demo_close_ready() -> bool {
+    DEMO.with(|demo| {
+        let mut demo = demo.borrow_mut();
+        if !demo.shutting_down {
+            demo.shutting_down = true;
+            let _ = demo.presenter.pause();
+        }
+        demo.presenter.prepare_shutdown()
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn erika_demo_update_headroom(headroom: f64) {
+    DEMO.with(|demo| {
+        demo.borrow_mut()
+            .presenter
+            .set_output_headroom(headroom as f32, headroom.is_finite())
     });
 }
 

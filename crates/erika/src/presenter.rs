@@ -746,6 +746,10 @@ impl PresenterRuntime {
         })
     }
 
+    pub fn prepare_shutdown(&mut self) -> bool {
+        self.renderer.prepare_shutdown()
+    }
+
     pub fn player(&self) -> &Player {
         &self.player
     }
@@ -841,6 +845,7 @@ impl PresenterRuntime {
     }
 
     pub fn open(&mut self, media: MediaRequest) -> Result<()> {
+        self.renderer.set_source_identity(&media.uri)?;
         self.quiesce_frame_output("open")?;
         self.reset_video_decode_resume_state();
         self.reset_audio_output_with_committed_rate();
@@ -1936,6 +1941,15 @@ impl PresenterRuntime {
     }
 
     fn pump_video(&mut self) {
+        if let Err(error) = self.renderer.begin_playback_generation(
+            self.player.playback_generation(),
+            self.audio_output
+                .clock_snapshot()
+                .and_then(|s| s.media_time)
+                .map(|t| t.as_secs_f64()),
+        ) {
+            trace::diagnostic(format!("shared HDR generation: {error}"));
+        }
         let started = Instant::now();
         let mut pumped = 0usize;
         loop {
@@ -3504,6 +3518,12 @@ fn build_renderer(
     match preference {
         #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
         RendererBackendPreference::PlatformNative | RendererBackendPreference::Auto => {
+            #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+            if let Some(adapter) =
+                crate::shared_hdr::SharedHDRRenderer::from_environment(_metal_config)?
+            {
+                return Ok(Box::new(adapter));
+            }
             Ok(Box::new(MetalRenderer::with_config(_metal_config)?))
         }
         #[cfg(target_os = "windows")]

@@ -50,6 +50,20 @@ fn main() {
         }
     }
 
+    if env::var_os("CARGO_FEATURE_SHARED_HDR").is_some() && target_os.as_deref() == Some("macos") {
+        println!("cargo:rerun-if-env-changed=ERIKA_FRAME_ENGINE_INCLUDE");
+        println!("cargo:rerun-if-changed=src/shared_hdr_bridge.c");
+        let include = env::var("ERIKA_FRAME_ENGINE_INCLUDE")
+            .expect("shared-hdr requires ERIKA_FRAME_ENGINE_INCLUDE pointing to the shared C API");
+        println!("cargo:rerun-if-changed={}/frame_engine.h", include);
+        cc::Build::new()
+            .file("src/shared_hdr_bridge.c")
+            .include(include)
+            .include(native_dep_dir("ERIKA_FFMPEG_DIR", "ffmpeg").join("include"))
+            .flag("-std=c11")
+            .compile("erika_shared_hdr_bridge");
+    }
+
     if env::var("CARGO_FEATURE_LIBASS").is_err() {
         return;
     }

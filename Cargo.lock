@@ -448,6 +448,7 @@ dependencies = [
  "ab_glyph",
  "aho-corasick",
  "ash",
+ "block2",
  "bytemuck",
  "cc",
  "chardetng",

@@ -237,6 +237,7 @@ impl VideoFrameTextureSource {
 pub enum ImportedVideoFormat {
     Nv12,
     P010,
+    Rgba16Float,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +255,8 @@ pub struct ImportedVideoFrameInfo {
 pub struct ImportedVideoFrame {
     info: ImportedVideoFrameInfo,
     source_color: SourceColorState,
+    #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+    shared_owner: Option<std::sync::Arc<crate::shared_hdr::EngineOutput>>,
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
     inner: Option<apple::ImportedVideoFrameTextures>,
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]
@@ -261,6 +264,19 @@ pub struct ImportedVideoFrame {
 }
 
 impl ImportedVideoFrame {
+    fn shared_geometry(&self) -> ([f32; 4], [f32; 4], u32, u32) {
+        #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+        if let Some(owner) = &self.shared_owner {
+            return owner.info.presentation_geometry();
+        }
+        (
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            self.info.width as u32,
+            self.info.height as u32,
+        )
+    }
+
     pub fn info(&self) -> &ImportedVideoFrameInfo {
         &self.info
     }
@@ -443,6 +459,41 @@ impl MetalRenderer {
         }
     }
 
+    #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+    pub fn upload_shared_hdr(
+        &mut self,
+        output: std::sync::Arc<crate::shared_hdr::EngineOutput>,
+        generation: u64,
+    ) -> Result<()> {
+        let info = output.info;
+        let mut imported = unsafe {
+            self.import_video_frame_textures(VideoFrameTextureSource::new(
+                info.pixels,
+                info.width,
+                info.height,
+            ))
+        }?;
+        imported.set_source_color(
+            SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Unknown)
+                .range(ColorRange::Full)
+                .nominal_peak_nits(10000.0)
+                .reference_white_nits(info.reference_white as f32),
+        );
+        imported.shared_owner = Some(output);
+        self.current_frame = Some(imported);
+        self.current_frame_visible = true;
+        self.current_media_time =
+            Duration::from_secs_f64((info.pts_value as f64 / info.pts_scale as f64).max(0.0));
+        self.current_generation = generation;
+        self.upload_counter = self.upload_counter.wrapping_add(1);
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+    pub fn shared_headroom(&mut self, headroom: f32) {
+        self.inner.shared_headroom(headroom);
+    }
+
     pub unsafe fn attach_raw_layer(
         &mut self,
         layer: *mut c_void,
@@ -474,6 +525,8 @@ impl MetalRenderer {
             Ok(ImportedVideoFrame {
                 info: imported.info,
                 source_color,
+                #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+                shared_owner: None,
                 inner: Some(imported.textures),
             })
         }
@@ -629,6 +682,8 @@ impl MetalRenderer {
             Ok(ImportedVideoFrame {
                 info: result.info,
                 source_color: SourceColorState::default(),
+                #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+                shared_owner: None,
                 inner: Some(result.textures),
             })
         }
@@ -1155,6 +1210,8 @@ mod tests {
                 planes: Vec::new(),
             },
             source_color,
+            #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+            shared_owner: None,
             #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos"))]
             inner: None,
             #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos")))]

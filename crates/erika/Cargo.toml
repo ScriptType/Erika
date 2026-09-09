@@ -10,6 +10,7 @@ build = "build.rs"
 [features]
 default = ["libass"]
 libass = []
+shared-hdr = ["dep:block2"]
 wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
@@ -37,6 +38,7 @@ bytemuck = { version = "1.25.0", features = ["derive"], optional = true }
 cc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6.2", optional = true }
 coreaudio-rs.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]

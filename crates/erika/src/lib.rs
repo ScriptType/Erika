@@ -24,3 +24,6 @@ mod trace;
 pub(crate) const NIPAPLAY_FALLBACK_FONT: &[u8] = include_bytes!("../assets/subfont.ttf");
 
 pub use core::*;
+
+#[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+pub mod shared_hdr;

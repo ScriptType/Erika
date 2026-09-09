@@ -1,10 +1,13 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <math.h>
+#import <stdlib.h>
 
 extern void erika_demo_attach_layer(void *layer, unsigned int width, unsigned int height, double scale);
 extern void erika_demo_resize_layer(unsigned int width, unsigned int height, double scale);
 extern void erika_demo_render_frame(double time_seconds);
+extern void erika_demo_update_headroom(double headroom);
+extern bool erika_demo_close_ready(void);
 extern void erika_demo_toggle_play_pause(void);
 extern void erika_demo_seek_seconds(double seconds);
 extern double erika_demo_position_seconds(void);
@@ -100,6 +103,7 @@ static NSString *ErikaFormatTime(double seconds) {
 - (void)renderTick:(NSTimer *)timer {
   (void)timer;
   double elapsed = CACurrentMediaTime() - self.startTime;
+  erika_demo_update_headroom(self.window.screen.maximumExtendedDynamicRangeColorComponentValue);
   erika_demo_render_frame(elapsed);
 }
 
@@ -281,6 +285,9 @@ static NSString *ErikaFormatTime(double seconds) {
   self.window.contentView = [[ErikaPlayerContainerView alloc] initWithFrame:frame];
   [self.window center];
   [self.window makeKeyAndOrderFront:nil];
+  if (getenv("ERIKA_ADAPTER_FOREGROUND") && strcmp(getenv("ERIKA_ADAPTER_FOREGROUND"), "1") == 0) {
+    [NSApp activateIgnoringOtherApps:YES];
+  }
   double smokeSeconds = erika_demo_smoke_seconds();
   if (smokeSeconds > 0.0) {
     self.smokeTimer = [NSTimer scheduledTimerWithTimeInterval:smokeSeconds
@@ -297,6 +304,18 @@ static NSString *ErikaFormatTime(double seconds) {
 - (void)smokeTimerFired:(NSTimer *)timer {
   (void)timer;
   [NSApp terminate:nil];
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
+  (void)sender;
+  if (erika_demo_close_ready()) return NSTerminateNow;
+  NSTimer *drainTimer = [NSTimer timerWithTimeInterval:0.02 repeats:YES block:^(NSTimer *timer) {
+    if (erika_demo_close_ready()) { [timer invalidate]; [NSApp replyToApplicationShouldTerminate:YES]; }
+  }];
+  // NSTerminateLater runs AppKit's modal loop, not the normal display loop.
+  [[NSRunLoop mainRunLoop] addTimer:drainTimer forMode:NSRunLoopCommonModes];
+  [[NSRunLoop mainRunLoop] addTimer:drainTimer forMode:NSModalPanelRunLoopMode];
+  return NSTerminateLater;
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {
