@@ -463,6 +463,10 @@ pub struct PlayerVideoFrame {
     pub media_time: Duration,
     pub late_by: Option<Duration>,
     pub generation: u64,
+    /// Present only for the opt-in asynchronous renderer. Returned on activation,
+    /// not on admission, so neither a duplicate acknowledgement nor a full
+    /// presenter channel can decode an unbounded sequence ahead of display.
+    pub enhancement_token: Option<u64>,
 }
 
 impl PlayerVideoFrame {
@@ -481,8 +485,17 @@ impl PlayerVideoFrame {
             media_time,
             late_by,
             generation,
+            enhancement_token: None,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsyncVideoOutput {
+    pub generation: u64,
+    pub token: u64,
+    pub pts: Duration,
+    pub duration: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -751,6 +764,14 @@ impl FlutterTextureHandle {
 }
 
 pub trait RendererBackend {
+    /// Ordinary and bypass renderers retain their synchronous upload contract.
+    fn uses_async_video_clock(&self) -> bool { false }
+
+    fn poll_async_video_output(&mut self) -> Result<Option<AsyncVideoOutput>> { Ok(None) }
+
+    fn activate_async_video_output(&mut self, _output: AsyncVideoOutput) -> Result<()> { Ok(()) }
+
+    fn set_presentation_clock_rate(&mut self, _rate: f64) {}
     fn set_source_identity(&mut self, _source: &str) -> Result<()> {
         Ok(())
     }
@@ -980,6 +1001,9 @@ struct PlayerInner {
     audio_frame_sender: Option<Sender<PlayerAudioFrame>>,
     subtitle_frame_sender: Option<Sender<PlayerSubtitleFrame>>,
     subtitle_frame_backpressure_drops: u64,
+    async_video_clock: bool,
+    async_video_eof: bool,
+    enhancement_audio_unavailable: bool,
 }
 
 struct PlayerLifecycle {
@@ -1012,12 +1036,25 @@ pub struct AudioClockObservation {
     snapshot: AudioClockSnapshot,
     captured_at: Instant,
     context: AudioClockContext,
+    pause_continuity: Option<AudioPauseContinuity>,
+}
+
+/// Certified only by the presenter after successful pauses of the same PCM
+/// output. The range permits skipped intermediate worker feedback; it never
+/// grants authority to an obsolete post-pause observation.
+#[derive(Debug, Clone, Copy)]
+struct AudioPauseContinuity {
+    from_epoch: u64,
+    before: AudioClockSnapshot,
 }
 
 impl AudioClockObservation {
     pub fn snapshot(&self) -> AudioClockSnapshot {
         self.snapshot
     }
+
+    pub(crate) fn output_epoch(&self) -> u64 { self.context.output_epoch }
+    pub(crate) fn captured_at(&self) -> Instant { self.captured_at }
 
     fn is_current(
         &self,
@@ -1037,6 +1074,13 @@ impl AudioClockObservation {
 }
 
 enum PlaybackCommand {
+    AsyncVideoClock(bool),
+    AsyncVideoFeedback {
+        generation: u64,
+        activated: Option<AsyncVideoOutput>,
+        held: bool,
+        audio: Option<AudioClockObservation>,
+    },
     Play {
         sequence: u64,
         generation: u64,
@@ -1169,6 +1213,9 @@ impl Player {
                 audio_frame_sender: None,
                 subtitle_frame_sender: None,
                 subtitle_frame_backpressure_drops: 0,
+                async_video_clock: false,
+                async_video_eof: false,
+                enhancement_audio_unavailable: false,
             })),
             lifecycle: Arc::new(Mutex::new(PlayerLifecycle {
                 epoch: 1,
@@ -1199,7 +1246,8 @@ impl Player {
         self.inner.lock().expect("player mutex poisoned").state
     }
 
-    pub(crate) fn is_stopped_at_end(&self) -> bool {
+    /// True only after natural EOF has stopped playback, not after a user stop.
+    pub fn is_stopped_at_end(&self) -> bool {
         let inner = self.inner.lock().expect("player mutex poisoned");
         inner.state == PlayerState::Stopped && inner.ended
     }
@@ -1470,6 +1518,62 @@ impl Player {
         Ok(())
     }
 
+    pub(crate) fn set_async_video_clock(&self, enabled: bool) -> Result<()> {
+        {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.async_video_clock = enabled;
+            inner.async_video_eof = false;
+            inner.enhancement_audio_unavailable = false;
+        }
+        if let Some(commands) = self.optional_playback_commands() {
+            commands.send(PlaybackCommand::AsyncVideoClock(enabled))
+                .map_err(|_| PlayerError::Playback("playback worker is not running".into()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn async_video_eof(&self) -> bool {
+        self.inner.lock().expect("player mutex poisoned").async_video_eof
+    }
+
+    pub(crate) fn enhancement_audio_unavailable(&self) -> bool {
+        self.inner.lock().expect("player mutex poisoned").enhancement_audio_unavailable
+    }
+
+    pub(crate) fn enhancement_feedback(&self, generation: u64,
+        activated: Option<AsyncVideoOutput>, held: bool, audio: Option<AudioClockObservation>) -> Result<()> {
+        self.send_playback_command(PlaybackCommand::AsyncVideoFeedback { generation, activated, held, audio })
+    }
+
+    pub(crate) fn capture_enhancement_audio(&self,
+        read: impl FnOnce() -> Option<AudioClockSnapshot>) -> Option<AudioClockObservation> {
+        let observation = self.capture_audio_clock(read)?;
+        let inner = self.inner.lock().expect("player mutex poisoned");
+        observation.is_current(&inner, inner.playback_generation,
+            inner.playback_command_sequence, Instant::now()).then_some(observation)
+    }
+
+    /// The output owner calls this only after successful internal pause, one
+    /// observation invalidation, and a fresh read of that same configured output.
+    pub(crate) fn certify_enhancement_pause(&self, before: AudioClockObservation,
+        mut after: AudioClockObservation, previous: Option<AudioClockObservation>) -> AudioClockObservation {
+        let inner = self.inner.lock().expect("player mutex poisoned");
+        let valid = before.player_id == self.id && after.player_id == self.id
+            && before.context.generation == after.context.generation
+            && before.context.command_sequence == after.context.command_sequence
+            && before.context.output_epoch.checked_add(1) == Some(after.context.output_epoch)
+            && before.captured_at < after.captured_at
+            && after.is_current(&inner, inner.playback_generation, inner.playback_command_sequence, Instant::now())
+            && crate::playback::enhancement_pcm_progress_is_monotonic(before.snapshot, after.snapshot);
+        if !valid { return after; }
+        let from_epoch = previous.filter(|prior| prior.player_id == self.id
+            && prior.context == before.context && prior.captured_at <= before.captured_at
+            && crate::playback::enhancement_pcm_progress_is_monotonic(prior.snapshot, before.snapshot))
+            .and_then(|prior| prior.pause_continuity).map_or(before.context.output_epoch, |proof| proof.from_epoch);
+        after.pause_continuity = Some(AudioPauseContinuity { from_epoch, before: before.snapshot });
+        after
+    }
+
     pub fn seek(&self, position: Duration) -> Result<()> {
         self.ensure_not_closed()?;
         let commands = self.playback_commands()?;
@@ -1655,6 +1759,7 @@ impl Player {
             snapshot,
             captured_at: Instant::now(),
             context,
+            pause_continuity: None,
         })
     }
 
@@ -1675,6 +1780,7 @@ impl Player {
             snapshot: read()?,
             captured_at,
             context,
+            pause_continuity: None,
         })
     }
 
@@ -1995,8 +2101,11 @@ fn run_playback_worker(
     commands: Receiver<PlaybackCommand>,
     initial_generation: u64,
 ) {
+    engine.set_async_video_clock(inner.lock().expect("player mutex poisoned").async_video_clock);
+    let mut pending_async_handoff: Option<PlayerVideoFrame> = None;
     let worker_started = std::time::Instant::now();
     let mut last_position_event = None;
+    let mut last_async_position_observed = None;
     let mut last_position_emit = Instant::now()
         .checked_sub(POSITION_EVENT_INTERVAL)
         .unwrap_or_else(Instant::now);
@@ -2062,6 +2171,13 @@ fn run_playback_worker(
             eof_published = false;
         }
         let after_commands = std::time::Instant::now();
+        let handoff_current = pending_async_handoff.as_ref().is_some_and(|frame| {
+            frame.generation == playback_generation && engine.uses_async_video_clock()
+                && frame.enhancement_token.is_some()
+                && frame.enhancement_token == engine.pending_enhancement_token()
+        });
+        retry_enhancement_handoff(&mut pending_async_handoff, frame_output_quiesced,
+            handoff_current, |frame| emit_async_video_frame_from_worker(&inner, frame));
 
         let audio_observation = last_audio_observation.filter(|observation| {
             observation.is_current(
@@ -2116,7 +2232,14 @@ fn run_playback_worker(
                         frame.late_by,
                         playback_generation,
                     ) {
-                        Ok(frame) => emit_video_frame_from_worker(&inner, frame),
+                        Ok(mut frame) => {
+                            if engine.uses_async_video_clock() {
+                                frame.enhancement_token = engine.pending_enhancement_token();
+                                pending_async_handoff = emit_async_video_frame_from_worker(&inner, frame);
+                            } else {
+                                emit_video_frame_from_worker(&inner, frame);
+                            }
+                        }
                         Err(error) => fail_playback_from_worker(
                             engine,
                             &inner,
@@ -2199,6 +2322,19 @@ fn run_playback_worker(
 
         emit_video_decoder_events_from_worker(engine, &inner);
 
+        if engine.uses_async_video_clock() {
+            // Input admission is ahead of presentation. Publish only the clock
+            // timeline, including the one paused-seek activation.
+            let observed = (playback_generation, engine.media_time());
+            if last_async_position_observed != Some(observed) {
+                last_position_event = Some(observed);
+                last_async_position_observed = Some(observed);
+            } else {
+                last_position_event = last_position_event.map(|_| observed);
+            }
+        } else {
+            last_async_position_observed = None;
+        }
         if last_position_event.is_some_and(|(generation, _)| generation != playback_generation) {
             last_position_event = None;
         }
@@ -2558,6 +2694,9 @@ fn observe_audio_pump_command(
                 *last_audio_observation = Some(*observation);
             }
         }
+        PlaybackCommand::AsyncVideoFeedback { audio, .. } => {
+            *last_audio_observation = *audio;
+        }
         PlaybackCommand::Play { .. }
             if matches!(
                 engine_state,
@@ -2566,7 +2705,8 @@ fn observe_audio_pump_command(
         {
             *last_audio_observation = None;
         }
-        PlaybackCommand::Seek { .. }
+        PlaybackCommand::AsyncVideoClock(_)
+        | PlaybackCommand::Seek { .. }
         | PlaybackCommand::Stop { .. }
         | PlaybackCommand::SetPlaybackRate(_)
         | PlaybackCommand::SelectSubtitleTrack(_)
@@ -2586,6 +2726,23 @@ fn handle_playback_command(
     frame_output_quiesced: &mut bool,
 ) -> bool {
     match command {
+        PlaybackCommand::AsyncVideoClock(enabled) => engine.set_async_video_clock(enabled),
+        PlaybackCommand::AsyncVideoFeedback { generation, activated, held, audio } => {
+            if generation == *playback_generation && generation == shared_playback_generation(inner) {
+                let valid = activated.is_none_or(|frame| frame.generation == generation);
+                let now = Instant::now();
+                if valid && engine.enhancement_feedback(activated.map(|frame|
+                    (frame.token, frame.pts, frame.duration)), held, now) {
+                    if let Some(audio) = audio.filter(|observation| observation.is_current(
+                        &inner.lock().expect("player mutex poisoned"), *playback_generation,
+                        *last_executed_playback_command_sequence, now)) {
+                        engine.reconcile_enhancement_audio_after_pause(audio.snapshot, audio.captured_at,
+                            audio.context.output_epoch, now,
+                            audio.pause_continuity.map(|proof| (proof.from_epoch, proof.before)));
+                    }
+                }
+            }
+        }
         PlaybackCommand::Play {
             sequence,
             generation,
@@ -3201,6 +3358,8 @@ fn sync_playback_clock_from_worker(
     // own tick so a slow worker loop cannot quantize playback position.
     inner.playback_clock = clock;
     inner.playback_generation = generation;
+    inner.async_video_eof = engine.async_video_eof();
+    inner.enhancement_audio_unavailable = engine.enhancement_audio_unavailable();
     *last_worker_clock = Some((media_time, generation));
 }
 
@@ -3417,6 +3576,30 @@ fn emit_video_frame_from_worker(inner: &Arc<Mutex<PlayerInner>>, frame: PlayerVi
     }
 }
 
+fn emit_async_video_frame_from_worker(inner: &Arc<Mutex<PlayerInner>>, frame: PlayerVideoFrame)
+    -> Option<PlayerVideoFrame> {
+    let shared = inner.lock().expect("player mutex poisoned");
+    let Some(sender) = shared.video_frame_sender.as_ref() else { return Some(frame); };
+    try_send_retained(sender, frame)
+}
+
+// A transition barrier acknowledges quiescence before this retry point. A
+// same-generation decoder reset also invalidates the one outstanding token.
+fn retry_enhancement_handoff<T>(pending: &mut Option<T>, quiesced: bool, current: bool,
+    send: impl FnOnce(T) -> Option<T>) {
+    if !current { *pending = None; }
+    if !quiesced {
+        if let Some(frame) = pending.take() { *pending = send(frame); }
+    }
+}
+
+fn try_send_retained<T>(sender: &Sender<T>, frame: T) -> Option<T> {
+    match sender.try_send(frame) {
+        Ok(()) => None,
+        Err(crossbeam_channel::TrySendError::Full(frame) | crossbeam_channel::TrySendError::Disconnected(frame)) => Some(frame),
+    }
+}
+
 fn audio_frame_output_is_active(inner: &Arc<Mutex<PlayerInner>>) -> bool {
     inner
         .lock()
@@ -3509,6 +3692,96 @@ fn emit_subtitle_frame_from_worker(inner: &Arc<Mutex<PlayerInner>>, frame: Playe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enhancement_audio_capture_rejects_old_epoch_and_preserves_pause_intent() {
+        let player = Player::new(PlayerConfig::default());
+        player.inner.lock().unwrap().state = PlayerState::Playing;
+        let before = player.capture_enhancement_audio(|| Some(audio_observation_test_sample())).unwrap();
+        player.invalidate_audio_clock();
+        let after = player.capture_enhancement_audio(|| Some(audio_observation_test_sample())).unwrap();
+        let inner = player.inner.lock().unwrap();
+        assert!(!before.is_current(&inner, inner.playback_generation, inner.playback_command_sequence, Instant::now()));
+        assert!(after.is_current(&inner, inner.playback_generation, inner.playback_command_sequence, Instant::now()));
+        drop(inner);
+        assert!(player.capture_enhancement_audio(|| { player.invalidate_audio_clock(); Some(audio_observation_test_sample()) }).is_none());
+        player.inner.lock().unwrap().state = PlayerState::Paused;
+        assert!(player.capture_enhancement_audio(|| Some(audio_observation_test_sample())).is_none());
+    }
+
+    #[test]
+    fn enhancement_pause_continuity_certifies_only_unchanged_output_and_current_post_context() {
+        let player = Player::new(PlayerConfig::default());
+        player.inner.lock().unwrap().state = PlayerState::Playing;
+        let sample = |reads| AudioClockSnapshot { media_time: Some(Duration::from_secs_f64(reads as f64/48_000.0)),
+            read_frames: reads, written_frames: 48_000, queued_frames: 48_000-reads as usize,
+            queued_duration: Some(Duration::from_secs_f64((48_000-reads) as f64/48_000.0)), underflow_frames: 0 };
+        let before = player.capture_enhancement_audio(|| Some(sample(512))).unwrap();
+        player.invalidate_audio_clock();
+        let after = player.capture_enhancement_audio(|| Some(sample(512))).unwrap();
+        let first = player.certify_enhancement_pause(before, after, None);
+        assert_eq!(first.pause_continuity.unwrap().from_epoch, before.output_epoch());
+        let second_before = player.capture_enhancement_audio(|| Some(sample(1024))).unwrap();
+        player.invalidate_audio_clock();
+        let second_after = player.capture_enhancement_audio(|| Some(sample(1024))).unwrap();
+        let second = player.certify_enhancement_pause(second_before, second_after, Some(first));
+        assert_eq!(second.pause_continuity.unwrap().from_epoch, before.output_epoch(), "bounded chain covers an unapplied intermediate pause");
+        let inner = player.inner.lock().unwrap();
+        assert!(!first.is_current(&inner, inner.playback_generation, inner.playback_command_sequence, Instant::now()));
+        assert!(second.is_current(&inner, inner.playback_generation, inner.playback_command_sequence, Instant::now()));
+        drop(inner);
+        let reset_before = player.capture_enhancement_audio(|| Some(sample(1024))).unwrap();
+        player.invalidate_audio_clock();
+        player.invalidate_audio_clock(); // an output reset/recovery is not a pause bridge
+        let reset_after = player.capture_enhancement_audio(|| Some(sample(1024))).unwrap();
+        assert!(player.certify_enhancement_pause(reset_before, reset_after, Some(second)).pause_continuity.is_none());
+        let next_before = player.capture_enhancement_audio(|| Some(sample(1536))).unwrap();
+        player.invalidate_audio_clock();
+        let next_after = player.capture_enhancement_audio(|| Some(sample(1536))).unwrap();
+        let next = player.certify_enhancement_pause(next_before, next_after, Some(second));
+        assert_eq!(next.pause_continuity.unwrap().from_epoch, next_before.output_epoch(), "reset breaks lineage even with monotonic counters");
+        let mut regressed = next_after; regressed.snapshot = sample(0);
+        assert!(player.certify_enhancement_pause(next_before, regressed, None).pause_continuity.is_none());
+        let mut pushed = next_after; pushed.snapshot.media_time = Some(Duration::from_secs(2));
+        assert!(player.certify_enhancement_pause(next_before, pushed, None).pause_continuity.is_none(), "push is not consumption");
+        let mut old_capture = next_after; old_capture.captured_at -= AUDIO_CLOCK_SNAPSHOT_STALE_AFTER;
+        assert!(player.certify_enhancement_pause(next_before, old_capture, None).pause_continuity.is_none());
+        player.inner.lock().unwrap().playback_command_sequence += 1;
+        assert!(player.certify_enhancement_pause(next_before, next_after, None).pause_continuity.is_none());
+        player.inner.lock().unwrap().state = PlayerState::Paused;
+        assert!(player.certify_enhancement_pause(next_before, next_after, None).pause_continuity.is_none());
+    }
+
+    #[test]
+    fn enhancement_handoff_obeys_barrier_and_same_generation_credit_reset() {
+        let frame = Arc::new(17_u64);
+        let mut pending = Some(frame.clone());
+        retry_enhancement_handoff(&mut pending, true, true, |_| panic!("barrier forbids send"));
+        assert!(Arc::ptr_eq(pending.as_ref().unwrap(), &frame));
+        retry_enhancement_handoff(&mut pending, false, false, |_| panic!("stale token forbids send"));
+        assert!(pending.is_none());
+        assert_eq!(Arc::strong_count(&frame), 1);
+        pending = Some(frame.clone());
+        let (sender, receiver) = bounded(1);
+        retry_enhancement_handoff(&mut pending, false, true, |frame| try_send_retained(&sender, frame));
+        assert!(pending.is_none());
+        assert!(Arc::ptr_eq(&receiver.recv().unwrap(), &frame));
+    }
+
+    #[test]
+    fn enhancement_handoff_retains_full_and_disconnected_owners() {
+        let (sender, receiver) = bounded(1);
+        let first = Arc::new(17_u64);
+        let next = Arc::new(29_u64);
+        assert!(try_send_retained(&sender, first.clone()).is_none());
+        let retained = try_send_retained(&sender, next.clone()).expect("full channel retains input");
+        assert!(Arc::ptr_eq(&retained, &next));
+        assert!(Arc::ptr_eq(&receiver.recv().unwrap(), &first));
+        assert!(try_send_retained(&sender, retained).is_none());
+        assert!(Arc::ptr_eq(&receiver.recv().unwrap(), &next));
+        drop(receiver);
+        assert!(Arc::ptr_eq(&try_send_retained(&sender, next.clone()).unwrap(), &next));
+    }
 
     #[test]
     fn media_request_normalizes_http_read_ahead_defaults() {

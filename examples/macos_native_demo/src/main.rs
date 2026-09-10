@@ -17,9 +17,57 @@ static SUBTITLE_PATH: OnceLock<String> = OnceLock::new();
 static DANMAKU_PATH: OnceLock<String> = OnceLock::new();
 static SMOKE_SECONDS: OnceLock<f64> = OnceLock::new();
 static EDR_HEADROOM: OnceLock<f32> = OnceLock::new();
+static ADAPTER_ACTIONS: OnceLock<Vec<AdapterAction>> = OnceLock::new();
+
+#[derive(Debug, Clone, PartialEq)]
+struct AdapterAction {
+    at: f64,
+    action: String,
+    seconds: Option<f64>,
+}
+
+fn parse_adapter_actions(raw: &str, smoke_seconds: Option<f64>) -> Result<Vec<AdapterAction>, String> {
+    let limit = smoke_seconds.filter(|v| v.is_finite() && *v > 0.0 && *v <= 600.0)
+        .ok_or("ERIKA_ADAPTER_ACTIONS requires --smoke-seconds in (0, 600]")?;
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| format!("invalid ERIKA_ADAPTER_ACTIONS JSON: {e}"))?;
+    let items = value.as_array().ok_or("ERIKA_ADAPTER_ACTIONS must be an array")?;
+    if items.len() > 64 { return Err("ERIKA_ADAPTER_ACTIONS accepts at most 64 actions".into()); }
+    let mut actions = Vec::with_capacity(items.len());
+    let mut previous = 0.0;
+    for (index, item) in items.iter().enumerate() {
+        let object = item.as_object().ok_or_else(|| format!("action {index} must be an object"))?;
+        if object.keys().any(|key| !matches!(key.as_str(), "at" | "action" | "seconds")) {
+            return Err(format!("action {index} contains an unknown field"));
+        }
+        let at = object.get("at").and_then(|v| v.as_f64())
+            .filter(|v| v.is_finite() && *v >= previous && *v < limit)
+            .ok_or_else(|| format!("action {index}: at must be finite, nonnegative, ordered, and before smoke timeout"))?;
+        let action = object.get("action").and_then(|v| v.as_str())
+            .filter(|v| matches!(*v, "pause" | "play" | "seek" | "audio-only" | "foreground"))
+            .ok_or_else(|| format!("action {index}: unsupported action"))?;
+        let seconds = if action == "seek" {
+            Some(object.get("seconds").and_then(|v| v.as_f64())
+                .filter(|v| v.is_finite() && *v >= 0.0 && Duration::try_from_secs_f64(*v).is_ok())
+                .ok_or_else(|| format!("action {index}: seek requires representable nonnegative seconds"))?)
+        } else {
+            if object.contains_key("seconds") { return Err(format!("action {index}: seconds is only valid for seek")); }
+            None
+        };
+        actions.push(AdapterAction { at, action: action.into(), seconds });
+        previous = at;
+    }
+    Ok(actions)
+}
+
+fn adapter_log(mut value: serde_json::Value) {
+    value["schemaVersion"] = 1.into();
+    value["hostSeconds"] = unsafe { CACurrentMediaTime() }.into();
+    println!("ERIKA_ADAPTER_TRANSPORT {value}");
+}
 
 unsafe extern "C" {
     fn erika_demo_run_app();
+    fn CACurrentMediaTime() -> f64;
 }
 
 thread_local! {
@@ -32,6 +80,12 @@ struct DemoState {
     overlay_logged: bool,
     adapter_seek_done: bool,
     shutting_down: bool,
+    adapter_next_action: usize,
+    adapter_audio_only: bool,
+    adapter_last_snapshot: Option<f64>,
+    adapter_snapshots: u32,
+    adapter_failures: u64,
+    adapter_last_elapsed: f64,
 }
 
 impl DemoState {
@@ -48,6 +102,12 @@ impl DemoState {
             overlay_logged: false,
             adapter_seek_done: false,
             shutting_down: false,
+            adapter_next_action: 0,
+            adapter_audio_only: false,
+            adapter_last_snapshot: None,
+            adapter_snapshots: 0,
+            adapter_failures: 0,
+            adapter_last_elapsed: 0.0,
         })
     }
 
@@ -55,6 +115,7 @@ impl DemoState {
         if self.shutting_down {
             return;
         }
+        self.adapter_last_elapsed = time_seconds;
         if !self.load_attempted {
             self.load_attempted = true;
             if env::var("ERIKA_ADAPTER_MUTE").as_deref() == Ok("1") {
@@ -79,10 +140,16 @@ impl DemoState {
                             Ok(()) => {
                                 eprintln!("Erika demo opened media through presenter runtime")
                             }
-                            Err(error) => eprintln!("Erika demo play failed: {error}"),
+                            Err(error) => {
+                                self.adapter_error("initial-play", time_seconds, &error.to_string());
+                                eprintln!("Erika demo play failed: {error}");
+                            }
                         }
                     }
-                    Err(error) => eprintln!("Erika demo video load failed: {error}"),
+                    Err(error) => {
+                        self.adapter_error("open", time_seconds, &error.to_string());
+                        eprintln!("Erika demo video load failed: {error}");
+                    }
                 }
             }
         }
@@ -105,15 +172,82 @@ impl DemoState {
                 }
             }
         }
-        match self.presenter.render_tick(time_seconds) {
+        self.run_adapter_actions(time_seconds);
+        let result = if self.adapter_audio_only {
+            self.presenter.audio_only_tick()
+        } else {
+            self.presenter.render_tick(time_seconds)
+        };
+        match result {
             Ok(stats) => {
                 if !self.overlay_logged && stats.overlay_frames > 0 {
                     eprintln!("Erika demo overlay active through presenter runtime");
                     self.overlay_logged = true;
                 }
             }
-            Err(error) => eprintln!("Erika demo render failed: {error}"),
+            Err(error) => {
+                self.adapter_error("tick", time_seconds, &error.to_string());
+                eprintln!("Erika demo render failed: {error}");
+            }
         }
+        self.adapter_snapshot(time_seconds);
+    }
+
+    fn adapter_error(&mut self, stage: &str, elapsed: f64, error: &str) {
+        if ADAPTER_ACTIONS.get().is_none() { return; }
+        self.adapter_failures += 1;
+        adapter_log(serde_json::json!({"event":"tick-error", "stage":stage,
+            "demoElapsedSeconds":elapsed, "error":error, "failures":self.adapter_failures}));
+    }
+
+    fn run_adapter_actions(&mut self, elapsed: f64) {
+        let Some(actions) = ADAPTER_ACTIONS.get() else { return; };
+        while let Some(action) = actions.get(self.adapter_next_action) {
+            if elapsed < action.at { break; }
+            let index = self.adapter_next_action;
+            self.adapter_next_action += 1; // Never silently retry a failed action.
+            let started = unsafe { CACurrentMediaTime() };
+            let result = match action.action.as_str() {
+                "pause" => self.presenter.pause(),
+                "play" => self.presenter.play(),
+                "seek" => self.presenter.seek(Duration::from_secs_f64(action.seconds.expect("validated seek"))),
+                "audio-only" => { self.adapter_audio_only = true; Ok(()) },
+                "foreground" => { self.adapter_audio_only = false; Ok(()) },
+                _ => unreachable!("validated action"),
+            };
+            let ended = unsafe { CACurrentMediaTime() };
+            if result.is_err() { self.adapter_failures += 1; }
+            adapter_log(serde_json::json!({"event":"action", "index":index,
+                "scheduledDemoElapsedSeconds":action.at, "demoElapsedSeconds":elapsed,
+                "action":action.action, "seconds":action.seconds,
+                "startHostSeconds":started, "endHostSeconds":ended,
+                "success":result.is_ok(), "error":result.err().map(|e| e.to_string()),
+                "resultScope":"public request result; subsequent snapshots/ticks establish actual state",
+                "audioOnlyRoute":self.adapter_audio_only, "failures":self.adapter_failures}));
+        }
+    }
+
+    fn adapter_snapshot(&mut self, elapsed: f64) {
+        if ADAPTER_ACTIONS.get().is_none() || self.adapter_snapshots >= 6000
+            || self.adapter_last_snapshot.is_some_and(|last| elapsed - last < 0.1) { return; }
+        self.adapter_last_snapshot = Some(elapsed);
+        self.adapter_snapshots += 1;
+        let snapshot = self.presenter.player().playback_snapshot();
+        let runtime = self.presenter.runtime_snapshot();
+        adapter_log(serde_json::json!({"event":"snapshot", "demoElapsedSeconds":elapsed,
+            "sample":self.adapter_snapshots, "mediaSeconds":snapshot.media_time().as_secs_f64(),
+            "isPlaying":snapshot.is_playing(), "generation":snapshot.generation,
+            "clockRunning":snapshot.clock.is_running(),
+            "durationSeconds":self.presenter.duration().map(|v| v.as_secs_f64()),
+            "eof":self.presenter.player().is_stopped_at_end(),
+            "audio":{"readFrames":runtime.audio_output_read_frames,
+                "writtenFrames":runtime.audio_output_written_frames,
+                "queuedFrames":runtime.audio_output_queued_frames,
+                "queuedSeconds":runtime.audio_output_queued_duration.map(|v| v.as_secs_f64()),
+                "underflowFrames":runtime.audio_output_underflow_frames,
+                "failures":runtime.stats.audio_failures},
+            "audioOnlyRoute":self.adapter_audio_only, "actionsCompleted":self.adapter_next_action,
+            "failures":self.adapter_failures}));
     }
 
     fn toggle_play_pause(&mut self) {
@@ -214,7 +348,17 @@ pub extern "C" fn erika_demo_close_ready() -> bool {
             demo.shutting_down = true;
             let _ = demo.presenter.pause();
         }
-        demo.presenter.prepare_shutdown()
+        let ready = demo.presenter.prepare_shutdown();
+        if ready {
+            if let Some(actions) = ADAPTER_ACTIONS.get() {
+                adapter_log(serde_json::json!({"event":"shutdown", "ready":true,
+                    "lastDemoElapsedSeconds":demo.adapter_last_elapsed,
+                    "actionsCompleted":demo.adapter_next_action, "actionsScheduled":actions.len(),
+                    "snapshots":demo.adapter_snapshots, "failures":demo.adapter_failures,
+                    "allActionsAttempted":demo.adapter_next_action == actions.len()}));
+            }
+        }
+        ready
     })
 }
 
@@ -277,6 +421,19 @@ fn main() {
         );
         process::exit(2);
     });
+    if let Ok(raw) = env::var("ERIKA_ADAPTER_ACTIONS") {
+        let actions = parse_adapter_actions(&raw, options.smoke_seconds).unwrap_or_else(|error| {
+            adapter_log(serde_json::json!({"event":"schedule-error", "success":false, "error":error}));
+            eprintln!("{error}");
+            process::exit(2);
+        });
+        adapter_log(serde_json::json!({"event":"schedule", "actionCount":actions.len(),
+            "actions":serde_json::from_str::<serde_json::Value>(&raw).expect("validated JSON"),
+            "timeDomain":"at uses native demo elapsed; hostSeconds uses CACurrentMediaTime",
+            "snapshotIntervalSeconds":0.1, "maximumSnapshots":6000,
+            "legacySeekEnabled":env::var_os("ERIKA_ADAPTER_SEEK_AT").is_some()}));
+        ADAPTER_ACTIONS.set(actions).expect("adapter actions set once");
+    }
     if let Some(path) = options.subtitle_path {
         SUBTITLE_PATH.set(path).expect("subtitle path is set once");
     }
@@ -399,6 +556,29 @@ fn parse_args(args: &[String]) -> Result<DemoOptions, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_schedule_preserves_order_and_seek_target() {
+        let actions = parse_adapter_actions(r#"[{"at":1,"action":"pause"},{"at":1,"action":"seek","seconds":3.5},{"at":2,"action":"audio-only"},{"at":3,"action":"foreground"},{"at":4,"action":"play"}]"#, Some(5.0)).unwrap();
+        assert_eq!(actions.len(), 5);
+        assert_eq!(actions[1].seconds, Some(3.5));
+        assert_eq!(actions[3].action, "foreground");
+        assert!(parse_adapter_actions("[]", Some(1.0)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn adapter_schedule_rejects_malformed_or_unbounded_requests() {
+        for raw in ["{}", "[null]", r#"[{"at":-1,"action":"play"}]"#,
+            r#"[{"at":1,"action":"seek"}]"#, r#"[{"at":1,"action":"seek","seconds":-1}]"#,
+            r#"[{"at":1,"action":"pause","seconds":2}]"#, r#"[{"at":1,"action":"stop"}]"#,
+            r#"[{"at":1,"action":"play","typo":0}]"#,
+            r#"[{"at":2,"action":"pause"},{"at":1,"action":"play"}]"#,
+            r#"[{"at":5,"action":"play"}]"#] {
+            assert!(parse_adapter_actions(raw, Some(5.0)).is_err(), "accepted {raw}");
+        }
+        assert!(parse_adapter_actions("[]", None).is_err());
+        assert!(parse_adapter_actions("[]", Some(601.0)).is_err());
+    }
 
     #[test]
     fn parse_args_accepts_media_and_smoke_seconds() {

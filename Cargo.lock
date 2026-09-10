@@ -947,6 +947,7 @@ dependencies = [
  "cc",
  "crossbeam-channel",
  "erika",
+ "serde_json",
 ]
 
 [[package]]

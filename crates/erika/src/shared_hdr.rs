@@ -117,11 +117,15 @@ pub struct EngineOutput {
     pub info: OutputInfo,
     session: Arc<SessionHandle>,
     clock: AtomicU64,
+    clock_rate: AtomicU64,
     presentations: AtomicU64,
 }
 impl EngineOutput {
     pub fn presentation_clock(&self) -> f64 {
         f64::from_bits(self.clock.load(Ordering::Relaxed))
+    }
+    pub fn presentation_clock_rate(&self) -> f64 {
+        f64::from_bits(self.clock_rate.load(Ordering::Relaxed))
     }
     pub fn drawable_submitted(&self) {
         if let Some(diagnostics) = &self.session.diagnostics {
@@ -187,6 +191,10 @@ pub struct SharedHDRRenderer {
     frame_id: u64,
     source_id: u64,
     current: Option<Arc<EngineOutput>>,
+    ready: Option<Arc<EngineOutput>>,
+    pending_token: Option<(u64, u64)>,
+    async_video: bool,
+    clock_rate: f64,
     clock_seconds: Option<f64>,
     capture: Option<CString>,
     captured_generation: Option<u64>,
@@ -283,6 +291,10 @@ impl SharedHDRRenderer {
             frame_id: 0,
             source_id,
             current: None,
+            ready: None,
+            pending_token: None,
+            async_video: model.is_some() && strength > 0.0,
+            clock_rate: 1.0,
             clock_seconds: None,
             capture,
             captured_generation: None,
@@ -319,10 +331,13 @@ impl SharedHDRRenderer {
                 .store(EngineOutput::host_time().to_bits(), Ordering::Relaxed)
         }
         self.current = None;
+        self.ready = None;
+        self.pending_token = None;
         self.frame_id = 0;
         self.inner.clear_current_frame()
     }
     fn poll(&mut self) -> Result<()> {
+        if self.async_video && self.ready.is_some() { return Ok(()); }
         loop {
             let mut info = OutputInfo::default();
             let lease = unsafe { erika_hdr_poll(self.session.raw, &mut info) };
@@ -334,6 +349,7 @@ impl SharedHDRRenderer {
                 info,
                 session: self.session.clone(),
                 clock: AtomicU64::new(f64::NAN.to_bits()),
+                clock_rate: AtomicU64::new(0.0_f64.to_bits()),
                 presentations: AtomicU64::new(0),
             });
             if info.generation != self.engine_generation {
@@ -345,6 +361,10 @@ impl SharedHDRRenderer {
                     unsafe { erika_hdr_capture(self.session.raw, lease, path.as_ptr()) }
                 }
                 self.captured_generation = Some(info.generation);
+            }
+            if self.async_video {
+                self.ready = Some(output);
+                break;
             }
             if let Some(previous) = &self.current {
                 if previous.presentations.load(Ordering::Relaxed) == 0 {
@@ -390,8 +410,9 @@ impl Drop for SharedHDRRenderer {
                 "unpresentedDrawableCallbacks":self.session.unpresented_drawables.load(Ordering::Relaxed),
                 "presentationDiagnostics":self.session.diagnostics.as_ref().map(|v| serde_json::to_value(&*v.lock().unwrap()).unwrap()),
                 "displayHeadroomRange":self.headroom_range,"renderer":format!("{:?}",self.inner.runtime_stats()),
-                "clockMeasurement":"audio callback media time sampled before encode, advanced to CAMetalDrawable presentedTime at 1x; unavailable without audio",
-                "limitations":["Live overload drops admission; synchronized buffering policy remains required","Late enhanced overlays omitted until timestamp pairing matches","No physical display accuracy or M5 performance claim"]});
+                "clockMeasurement":"audio callback media time sampled before encode, extrapolated to CAMetalDrawable presentedTime at the sampled running playback rate or zero while held; later transport changes are not reconstructed; unavailable without audio",
+                "asynchronousVideoClock":self.async_video,
+                "limitations":["Shared HDR enhancement holds audio and media clock when the next output misses its current-frame interval; native/bypass retains its existing synchronous policy","Late enhanced overlays omitted until timestamp pairing matches","No physical display accuracy or M5 performance claim"]});
                 let _ = std::fs::write(
                     format!("{}.adapter.json", path.to_string_lossy()),
                     serde_json::to_vec_pretty(&diagnostics).unwrap(),
@@ -408,6 +429,36 @@ impl Drop for SharedHDRRenderer {
     }
 }
 impl RendererBackend for SharedHDRRenderer {
+    fn uses_async_video_clock(&self) -> bool { self.async_video }
+
+    fn poll_async_video_output(&mut self) -> Result<Option<AsyncVideoOutput>> {
+        if !self.async_video { return Ok(None); }
+        self.poll()?;
+        self.ready.as_ref().map(|output| {
+            let info = &output.info;
+            if info.pts_scale <= 0 || info.pts_value < 0 || info.duration_scale <= 0 || info.duration_value <= 0 {
+                return Err(PlayerError::Renderer("shared HDR completion has invalid timeline".into()));
+            }
+            let token = self.pending_token.filter(|(id, _)| *id == info.frame_id)
+                .map(|(_, token)| token).ok_or_else(|| PlayerError::Renderer("completion has no matching asynchronous credit".into()))?;
+            Ok(AsyncVideoOutput { generation: self.playback_generation.unwrap_or(1), token,
+                pts: Duration::from_secs_f64(info.pts_value as f64 / info.pts_scale as f64),
+                duration: Duration::from_secs_f64(info.duration_value as f64 / info.duration_scale as f64) })
+        }).transpose()
+    }
+
+    fn activate_async_video_output(&mut self, selected: AsyncVideoOutput) -> Result<()> {
+        if self.poll_async_video_output()? != Some(selected) {
+            return Err(PlayerError::Renderer("stale shared HDR activation".into()));
+        }
+        let output = self.ready.as_ref().expect("validated ready output");
+        self.inner.upload_shared_hdr(output.clone(), selected.generation)?;
+        self.current = self.ready.take();
+        self.pending_token = None;
+        Ok(())
+    }
+
+    fn set_presentation_clock_rate(&mut self, rate: f64) { self.clock_rate = rate; }
     fn set_source_identity(&mut self, source: &str) -> Result<()> {
         // Stable per-source identifier; generation still distinguishes each seek.
         self.source_id = source
@@ -423,6 +474,8 @@ impl RendererBackend for SharedHDRRenderer {
         if !self.shutting_down {
             self.shutting_down = true;
             self.current = None;
+            self.ready = None;
+            self.pending_token = None;
             let _ = self.inner.clear_current_frame();
         }
         unsafe { erika_hdr_close_ready(self.session.raw) != 0 }
@@ -470,8 +523,11 @@ impl RendererBackend for SharedHDRRenderer {
             .pts()
             .ok_or_else(|| PlayerError::Renderer("shared HDR input has no rational PTS".into()))?;
         self.decoded_frames += 1;
+        if self.async_video && (frame.enhancement_token.is_none() || self.pending_token.is_some()) {
+            return Err(PlayerError::Renderer("missing or duplicate asynchronous video credit".into()));
+        }
         let id = self.frame_id;
-        self.frame_id = self.frame_id.wrapping_add(1);
+        if !self.async_video { self.frame_id = self.frame_id.wrapping_add(1); }
         let status = unsafe {
             erika_hdr_submit(
                 self.session.raw,
@@ -484,14 +540,17 @@ impl RendererBackend for SharedHDRRenderer {
             )
         };
         match status {
-            0=>Ok(()),
-            1=>{self.admission_drops+=1;unsafe{erika_hdr_dropped(self.session.raw,self.engine_generation,id)};Err(PlayerError::RendererBackpressure("shared HDR engine full (three retained slots)".into()))},
-            2|5=>Ok(()),
+            0=>{if self.async_video {
+                self.pending_token = Some((id, frame.enhancement_token.expect("validated credit")));
+                self.frame_id = self.frame_id.wrapping_add(1);
+            } Ok(())},
+            1=>{if !self.async_video {self.admission_drops+=1;unsafe{erika_hdr_dropped(self.session.raw,self.engine_generation,id)}};Err(PlayerError::RendererBackpressure("shared HDR engine full (three retained slots)".into()))},
+            2|5 if !self.async_video=>Ok(()),
             _=>Err(PlayerError::Renderer("shared HDR rejected frame metadata/ownership; inspect source colour tags and rational duration".into()))
         }
     }
     fn render_current_frame(&mut self, mut context: RenderFrameContext<'_>) -> Result<bool> {
-        self.poll()?;
+        if !self.async_video { self.poll()?; }
         let Some(output) = self.current.as_ref() else {
             return Ok(false);
         };
@@ -511,6 +570,7 @@ impl RendererBackend for SharedHDRRenderer {
             self.clock_seconds.unwrap_or(f64::NAN).to_bits(),
             Ordering::Relaxed,
         );
+        output.clock_rate.store(self.clock_rate.to_bits(), Ordering::Relaxed);
         self.inner.render_current_frame(context)
     }
     fn clear_current_frame(&mut self) -> Result<()> {

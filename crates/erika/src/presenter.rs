@@ -29,7 +29,7 @@ use crate::audio::{
     AudioClockSnapshot, AudioOutputBackend, AudioOutputRuntimeStats, AudioRingBufferConfig,
 };
 use crate::core::{
-    AudioOutputEvent, MediaRequest, PlatformSurface, PlaybackSnapshot, Player, PlayerAudioFrame,
+    AsyncVideoOutput, AudioClockObservation, AudioOutputEvent, MediaRequest, PlatformSurface, PlaybackSnapshot, Player, PlayerAudioFrame,
     PlayerConfig, PlayerSubtitleFrame, PlayerVideoFrame, RenderFrameContext, RendererBackend,
     RendererBackendPreference, RendererRuntimeStats, SurfaceMetrics, TrackInfo, TrackSelection,
     VideoDecoderEvent, VideoFrameImportFailure,
@@ -238,6 +238,16 @@ pub struct PresenterStats {
     pub audio_failures: u64,
 }
 
+fn start_ready_audio_output(output: &mut dyn AudioOutputBackend, allowed: bool,
+    resume_retained_pcm: bool) -> crate::audio::Result<bool> {
+    let ready = output.clock_snapshot().and_then(|snapshot| snapshot.queued_duration)
+        .is_some_and(|queued| queued >= AUDIO_START_BUFFER
+            || (resume_retained_pcm && !queued.is_zero()));
+    if !allowed || !ready { return Ok(false); }
+    output.start()?;
+    Ok(true)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct PresenterRuntimeSnapshot {
     pub stats: PresenterStats,
@@ -282,6 +292,18 @@ pub struct PresenterRuntimeSnapshot {
     pub last_render_test_duration: Duration,
 }
 
+pub(crate) fn enhancement_activation_due(current: Option<AsyncVideoOutput>, ready: AsyncVideoOutput,
+    playing: bool, media: Duration) -> bool {
+    current.is_none() || (playing && ready.pts <= media)
+}
+
+pub(crate) fn enhancement_hold_required(current: Option<AsyncVideoOutput>, ready: Option<AsyncVideoOutput>,
+    media: Duration, video_eof: bool) -> bool {
+    ready.is_none() && !video_eof && current.is_none_or(|frame| {
+        media.saturating_add(Duration::from_millis(2)) >= frame.pts.saturating_add(frame.duration)
+    })
+}
+
 pub struct PresenterRuntime {
     player: Player,
     renderer: Box<dyn RendererBackend>,
@@ -292,6 +314,14 @@ pub struct PresenterRuntime {
     audio_output: Box<dyn AudioOutputBackend>,
     audio_configured: bool,
     audio_started: bool,
+    audio_resume_pending: bool,
+    enhancement_generation: Option<u64>,
+    enhancement_current: Option<AsyncVideoOutput>,
+    enhancement_held: bool,
+    enhancement_retry: Option<PlayerVideoFrame>,
+    enhancement_geometry: (usize, usize),
+    enhancement_audio_clock: crate::playback::EnhancementAudioClock,
+    enhancement_pause_continuity: Option<AudioClockObservation>,
     last_audio_clock_report: Option<AudioClockReportState>,
     last_audio_runtime_stats: AudioOutputRuntimeStats,
     playback_rate: f64,
@@ -680,6 +710,8 @@ impl PresenterRuntime {
         let player = Player::new_with_ohos_avcodec_surface(config.player, ohos_avcodec_surface);
         #[cfg(not(target_env = "ohos"))]
         let player = Player::new(config.player);
+        let async_video = renderer.uses_async_video_clock();
+        player.set_async_video_clock(async_video)?;
         let video_frames = player.subscribe_video_frames();
         let audio_frames = player.subscribe_audio_frames();
         let subtitle_frames = player.subscribe_subtitle_frames();
@@ -703,6 +735,14 @@ impl PresenterRuntime {
             audio_output: build_audio_output(config.audio),
             audio_configured: false,
             audio_started: false,
+            audio_resume_pending: false,
+            enhancement_generation: None,
+            enhancement_current: None,
+            enhancement_held: async_video,
+            enhancement_retry: None,
+            enhancement_geometry: (1, 1),
+            enhancement_audio_clock: crate::playback::EnhancementAudioClock::default(),
+            enhancement_pause_continuity: None,
             last_audio_clock_report: None,
             last_audio_runtime_stats: AudioOutputRuntimeStats::default(),
             playback_rate: 1.0,
@@ -853,6 +893,7 @@ impl PresenterRuntime {
         self.drain_pending_player_frames();
         self.current_generation = self.current_generation.saturating_add(1).max(1);
         self.latest_video_decoder = None;
+        self.player.set_async_video_clock(self.renderer.uses_async_video_clock())?;
         let result = self.player.open(media);
         let rate_result = if result.is_ok() && !playback_rate_matches(self.playback_rate, 1.0) {
             self.player.set_playback_rate(self.playback_rate)
@@ -1415,6 +1456,7 @@ impl PresenterRuntime {
         let video_started = Instant::now();
         self.pump_video();
         self.last_video_pump_duration = video_started.elapsed();
+        self.update_enhancement_presentation()?;
 
         let audio_started = Instant::now();
         // Publish a callback-observed disconnection before clock/push recovery
@@ -1423,6 +1465,15 @@ impl PresenterRuntime {
         self.pump_audio();
         self.report_audio_output_runtime_stats();
         self.last_audio_pump_duration = audio_started.elapsed();
+
+        if self.renderer.uses_async_video_clock() {
+            let clock = self.audio_output.clock_snapshot().and_then(|value| value.media_time)
+                .map(|value| value.as_secs_f64());
+            self.renderer.begin_playback_generation(self.player.playback_generation(), clock)?;
+            self.renderer.set_presentation_clock_rate(if self.audio_started && !self.enhancement_held && self.is_playing() {
+                self.playback_rate
+            } else { 0.0 });
+        }
 
         let sync_started = Instant::now();
         let _snapshot = self.sync_media_time_from_player();
@@ -1591,6 +1642,16 @@ impl PresenterRuntime {
         self.resume_pending = false;
         self.video_decode_resume_attempts = 0;
         if !self.audio_only_tick_active {
+            if self.renderer.uses_async_video_clock() {
+                self.player.set_async_video_clock(false)?;
+                self.enhancement_held = false;
+                self.enhancement_current = None;
+                self.enhancement_retry = None;
+                self.enhancement_generation = None;
+                self.enhancement_audio_clock = crate::playback::EnhancementAudioClock::default();
+            self.enhancement_pause_continuity = None;
+                self.renderer.clear_current_frame()?;
+            }
             self.player.set_video_decode_suspended(true)?;
             self.discard_pending_video_frames();
             self.audio_only_tick_active = true;
@@ -1664,7 +1725,20 @@ impl PresenterRuntime {
         }
 
         self.discard_pending_video_frames();
-        match self.player.set_video_decode_suspended(false) {
+        let result = (|| -> Result<()> {
+            if self.renderer.uses_async_video_clock() {
+                self.renderer.clear_current_frame()?;
+                self.enhancement_generation = None;
+                self.enhancement_audio_clock = crate::playback::EnhancementAudioClock::default();
+            self.enhancement_pause_continuity = None;
+                self.enhancement_current = None;
+                self.enhancement_retry = None;
+                self.player.set_async_video_clock(true)?;
+                self.set_enhancement_hold(true, None)?;
+            }
+            self.player.set_video_decode_suspended(false).map(|_| ())
+        })();
+        match result {
             Ok(_) => {
                 self.audio_only_tick_active = false;
                 self.resume_pending = false;
@@ -1677,7 +1751,21 @@ impl PresenterRuntime {
                     .to_string(),
                 );
             }
-            Err(error) => self.note_video_decode_resume_failure(&error.to_string()),
+            Err(error) => {
+                if self.renderer.uses_async_video_clock() {
+                    // A failed/abandoned surface resume must keep background
+                    // audio alive, rather than leaving an internal hold armed.
+                    let _ = self.player.set_async_video_clock(false);
+                    self.enhancement_held = false;
+                    self.enhancement_current = None;
+                    self.enhancement_retry = None;
+                    self.enhancement_generation = None;
+                self.enhancement_audio_clock = crate::playback::EnhancementAudioClock::default();
+            self.enhancement_pause_continuity = None;
+                    let _ = self.renderer.clear_current_frame();
+                }
+                self.note_video_decode_resume_failure(&error.to_string());
+            }
         }
     }
 
@@ -1940,7 +2028,126 @@ impl PresenterRuntime {
         }
     }
 
+    fn set_enhancement_hold(&mut self, held: bool, activated: Option<AsyncVideoOutput>) -> Result<()> {
+        let changed = self.enhancement_held != held || activated.is_some();
+        let before = self.audio_output.clock_snapshot();
+        let started = Instant::now();
+        if held && self.audio_started { self.report_audio_output_runtime_stats(); }
+        let pause_before = if held && self.audio_started { self.capture_enhancement_audio() } else { None };
+        if held && self.audio_started {
+            self.audio_output.pause().map_err(|error| PlayerError::Playback(format!("enhancement audio pause: {error}")))?;
+            self.audio_started = false;
+            self.audio_resume_pending = true;
+            self.last_audio_clock_report = None;
+            self.player.invalidate_audio_clock();
+            self.report_audio_output_runtime_stats();
+        }
+        // Capture after a successful pause and its epoch invalidation. The
+        // worker rechecks the complete identity before accepting this cursor.
+        let audio = self.capture_enhancement_audio().map(|after| {
+            if let Some(before) = pause_before {
+                let certified = self.player.certify_enhancement_pause(before, after, self.enhancement_pause_continuity);
+                self.enhancement_pause_continuity = Some(certified);
+                certified
+            } else { after }
+        });
+        if changed || audio.is_some() {
+            self.player.enhancement_feedback(self.player.playback_generation(), activated, held, audio)?;
+        }
+        self.enhancement_held = held;
+        if changed && std::env::var("ERIKA_ADAPTER_DIAGNOSTICS").as_deref() == Ok("1") {
+            #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
+            let host_time = Some(crate::shared_hdr::EngineOutput::host_time());
+            #[cfg(not(all(target_os = "macos", feature = "shared-hdr")))]
+            let host_time: Option<f64> = None;
+            trace::diagnostic(serde_json::json!({
+            "event": "enhancement_transport", "held": held,
+            "hostTimeSeconds": host_time,
+            "clockScope": "host uses shared-engine monotonic clock; worker feedback is enqueued, not yet acknowledged",
+            "generation": self.player.playback_generation(),
+            "activatedToken": activated.map(|frame| frame.token),
+            "activatedPTS": activated.map(|frame| frame.pts.as_secs_f64()),
+            "audioBefore": before.and_then(|clock| clock.media_time).map(|time| time.as_secs_f64()),
+            "audioAfter": self.audio_output.clock_snapshot().and_then(|clock| clock.media_time).map(|time| time.as_secs_f64()),
+            "anchorAudioSeconds": audio.and_then(|value| value.snapshot().media_time).map(|time| time.as_secs_f64()),
+            "anchorOutputEpoch": audio.map(|value| value.output_epoch()),
+            "audioReadFrames": audio.map(|value| value.snapshot().read_frames),
+            "audioWrittenFrames": audio.map(|value| value.snapshot().written_frames),
+            "audioQueuedFrames": audio.map(|value| value.snapshot().queued_frames),
+            "temporaryAudioUnavailable": self.player.enhancement_audio_unavailable(),
+            "transitionSeconds": started.elapsed().as_secs_f64(),
+            "userPlaying": self.is_playing(),
+        }).to_string());
+        }
+        Ok(())
+    }
+
+    fn capture_enhancement_audio(&mut self) -> Option<AudioClockObservation> {
+        self.player.capture_enhancement_audio(|| {
+            self.audio_output.clock_snapshot().or_else(|| {
+                // An unconfigured output has no cursor, but its empty queue is
+                // still useful for bounded no-drop audio-unavailability checks.
+                let stats = self.audio_output.stats();
+                Some(AudioClockSnapshot { media_time: None, queued_duration: None,
+                    queued_frames: stats.queued_frames, read_frames: stats.read_frames,
+                    written_frames: stats.written_frames, underflow_frames: stats.underflow_frames })
+            })
+        })
+    }
+
+    fn update_enhancement_presentation(&mut self) -> Result<()> {
+        if !self.renderer.uses_async_video_clock() || self.audio_only_tick_active { return Ok(()); }
+        let ready = self.renderer.poll_async_video_output()?;
+        if ready.is_some_and(|frame| frame.generation != self.player.playback_generation()) {
+            return Err(PlayerError::Renderer("stale asynchronous completion before activation".into()));
+        }
+        let audio = self.capture_enhancement_audio();
+        let audio_selected = self.player.track_selection().audio.is_some()
+            && !self.player.enhancement_audio_unavailable();
+        let media = if audio_selected {
+            audio.and_then(|value| self.enhancement_audio_clock.observe(value.snapshot(),
+                value.output_epoch(), value.captured_at(), Duration::ZERO))
+        } else { Some(self.player.current_media_time()) };
+        let mut activated = None;
+        if let Some(frame) = ready {
+            if self.enhancement_current.is_none() || media.is_some_and(|media|
+                enhancement_activation_due(self.enhancement_current, frame, self.is_playing(), media)) {
+                self.renderer.activate_async_video_output(frame)?;
+                self.enhancement_current = Some(frame);
+                self.current_media_time = frame.pts;
+                self.current_generation = frame.generation;
+                self.update_overlay(frame.pts, frame.generation, self.enhancement_geometry.0, self.enhancement_geometry.1);
+                activated = Some(frame);
+            }
+        }
+        // A future completion releases the hold so the current frame/audio can
+        // finish its interval; activation itself still waits for that exact PTS.
+        // The short lead is only a timer margin, not a timestamp alteration.
+        // A consumed completion is no longer a future-ready release. Catch up
+        // ordered frames without restarting audio already beyond their interval.
+        let pending_ready = if activated.is_some() { None } else { ready };
+        let held = self.enhancement_current.is_none() || media.is_some_and(|media|
+            enhancement_hold_required(self.enhancement_current, pending_ready, media, self.player.async_video_eof()));
+        if activated.is_some() && std::env::var("ERIKA_ADAPTER_DIAGNOSTICS").as_deref() == Ok("1") {
+            trace::diagnostic(serde_json::json!({"event":"enhancement_activation_clock",
+                "generation":self.player.playback_generation(),"token":activated.map(|v|v.token),
+                "selectedClock":if audio_selected { "actual_audio" } else { "wall_no_audio_or_explicit_gap" },
+                "selectedMediaSeconds":media.map(|v|v.as_secs_f64()),
+                "audioReadFrames":audio.map(|v|v.snapshot().read_frames),
+                "audioQueuedFrames":audio.map(|v|v.snapshot().queued_frames)}).to_string());
+        }
+        self.set_enhancement_hold(held, activated)?;
+        let clock = self.audio_output.clock_snapshot().and_then(|clock| clock.media_time)
+            .map(|time| time.as_secs_f64());
+        self.renderer.begin_playback_generation(self.player.playback_generation(), clock)?;
+        self.renderer.set_presentation_clock_rate(if self.audio_started && !held && self.is_playing() {
+            self.playback_rate
+        } else { 0.0 });
+        Ok(())
+    }
+
     fn pump_video(&mut self) {
+        if self.renderer.uses_async_video_clock() && self.audio_only_tick_active { return; }
         if let Err(error) = self.renderer.begin_playback_generation(
             self.player.playback_generation(),
             self.audio_output
@@ -1950,13 +2157,26 @@ impl PresenterRuntime {
         ) {
             trace::diagnostic(format!("shared HDR generation: {error}"));
         }
+        if self.renderer.uses_async_video_clock() && self.enhancement_generation != Some(self.player.playback_generation()) {
+            self.enhancement_generation = Some(self.player.playback_generation());
+            self.enhancement_audio_clock = crate::playback::EnhancementAudioClock::default();
+            self.enhancement_pause_continuity = None;
+            self.enhancement_current = None;
+            self.enhancement_retry = None;
+            // The engine resets its own credit on generation changes. A local
+            // hold stops audio even if it was running before the seek.
+            self.enhancement_held = false;
+            if let Err(error) = self.set_enhancement_hold(true, None) {
+                trace::diagnostic(format!("shared HDR hold: {error}"));
+            }
+        }
         let started = Instant::now();
         let mut pumped = 0usize;
         loop {
             if pumped >= VIDEO_PUMP_FRAME_LIMIT || started.elapsed() >= VIDEO_PUMP_TIME_BUDGET {
                 break;
             }
-            match self.video_frames.try_recv() {
+            match self.enhancement_retry.take().map_or_else(|| self.video_frames.try_recv(), Ok) {
                 Ok(frame) => {
                     if frame.generation != self.player.playback_generation() {
                         continue;
@@ -1976,6 +2196,10 @@ impl PresenterRuntime {
                     self.stats.decoded_video_frames += 1;
                     match self.renderer.upload_player_frame(&frame) {
                         Ok(()) => {
+                            if self.renderer.uses_async_video_clock() {
+                                self.enhancement_geometry = (frame.frame.width() as usize, frame.frame.height() as usize);
+                                break;
+                            }
                             if self.rejected_video_import_route.is_some() {
                                 self.rejected_video_import_route = None;
                             }
@@ -2010,6 +2234,10 @@ impl PresenterRuntime {
                             pumped += 1;
                         }
                         Err(PlayerError::RendererBackpressure(reason)) => {
+                            if self.renderer.uses_async_video_clock() {
+                                self.enhancement_retry = Some(frame);
+                                break;
+                            }
                             self.stats.video_frame_backpressure_drops =
                                 self.stats.video_frame_backpressure_drops.saturating_add(1);
                             let drop_count = self.stats.video_frame_backpressure_drops;
@@ -3083,7 +3311,9 @@ impl PresenterRuntime {
 
     fn push_audio(&mut self, frame: PlayerAudioFrame) {
         if !self.audio_configured {
-            self.player.invalidate_audio_clock();
+            self.audio_resume_pending = false;
+            self.enhancement_pause_continuity = None;
+        self.player.invalidate_audio_clock();
             if let Err(error) = self.audio_output.configure(frame.frame.format) {
                 self.stats.audio_failures += 1;
                 eprintln!("Erika presenter audio configure failed: {error}");
@@ -3105,27 +3335,20 @@ impl PresenterRuntime {
     }
 
     fn ensure_audio_started(&mut self) {
-        if !self.is_playing()
-            || self.audio_started
-            || !self.audio_output_ready_to_start()
-            || !self.audio_start_allowed()
-        {
-            return;
+        let allowed = self.is_playing() && !self.enhancement_held
+            && !self.audio_started && self.audio_start_allowed();
+        match start_ready_audio_output(self.audio_output.as_mut(), allowed, self.audio_resume_pending) {
+            Ok(true) => {
+                self.audio_started = true;
+                self.audio_resume_pending = false;
+                self.last_audio_clock_report = None;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.stats.audio_failures += 1;
+                eprintln!("Erika presenter audio start failed: {error}");
+            }
         }
-        if let Err(error) = self.audio_output.start() {
-            self.stats.audio_failures += 1;
-            eprintln!("Erika presenter audio start failed: {error}");
-            return;
-        }
-        self.audio_started = true;
-        self.last_audio_clock_report = None;
-    }
-
-    fn audio_output_ready_to_start(&self) -> bool {
-        self.audio_output
-            .clock_snapshot()
-            .and_then(|snapshot| snapshot.queued_duration)
-            .is_some_and(|queued| queued >= AUDIO_START_BUFFER)
     }
 
     fn audio_start_allowed(&self) -> bool {
@@ -3133,6 +3356,7 @@ impl PresenterRuntime {
     }
 
     fn reset_audio_output(&mut self) {
+        self.enhancement_pause_continuity = None;
         self.player.invalidate_audio_clock();
         if let Err(error) = self.audio_output.stop() {
             self.stats.audio_failures += 1;
@@ -3140,6 +3364,7 @@ impl PresenterRuntime {
         }
         self.audio_configured = false;
         self.audio_started = false;
+        self.audio_resume_pending = false;
         self.last_audio_clock_report = None;
     }
 
@@ -3169,6 +3394,7 @@ impl PresenterRuntime {
         }
         self.playback_rate = rate;
         self.pending_playback_rate = None;
+        self.enhancement_pause_continuity = None;
         self.player.invalidate_audio_clock();
         self.last_audio_clock_report = None;
         Ok(())
@@ -3179,6 +3405,7 @@ impl PresenterRuntime {
         if stats.transition_sequence == self.last_audio_runtime_stats.transition_sequence {
             return;
         }
+        self.enhancement_pause_continuity = None;
         self.player.invalidate_audio_clock();
         self.last_audio_clock_report = None;
         self.last_audio_runtime_stats = stats;
@@ -4072,6 +4299,55 @@ fn append_text_subtitles_debug(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enhancement_audio_resume_plays_retained_short_tail_and_respects_pause() {
+        use crate::audio::{AudioOutputState, BufferedAudioOutput};
+        use crate::ffmpeg::{PcmAudioFrame, PcmFormat};
+        let format = PcmFormat::f32_interleaved(48_000, 2);
+        let mut output = BufferedAudioOutput::new(AudioRingBufferConfig::default());
+        output.configure(format).unwrap();
+        output.push(PcmAudioFrame { format, pts: Some(Duration::ZERO), frames: 14_400,
+            samples: vec![0.25; 28_800] }).unwrap();
+        assert!(start_ready_audio_output(&mut output, true, false).unwrap());
+        output.read_interleaved(&mut vec![0.0; 19_200]).unwrap();
+        output.pause().unwrap();
+        let paused = output.clock_snapshot();
+        assert_eq!(paused.queued_duration, Some(Duration::from_millis(100)));
+        assert!(!start_ready_audio_output(&mut output, false, true).unwrap(), "user pause/internal hold wins");
+        assert_eq!(output.state(), AudioOutputState::Paused);
+        assert_eq!(output.clock_snapshot().media_time, paused.media_time);
+        assert_eq!(output.clock_snapshot().queued_frames, paused.queued_frames);
+        assert_eq!(output.clock_snapshot().read_frames, paused.read_frames);
+        assert!(!start_ready_audio_output(&mut output, true, false).unwrap(), "initial prefill remains 250ms");
+        assert!(start_ready_audio_output(&mut output, true, true).unwrap());
+        let mut tail = vec![0.0; 9600];
+        output.read_interleaved(&mut tail).unwrap();
+        assert!(tail.iter().all(|&value| value == 0.25));
+        assert_eq!(output.clock_snapshot().queued_frames, 0);
+        output.stop().unwrap();
+        assert!(!start_ready_audio_output(&mut output, true, true).unwrap(), "no empty resume");
+        output.configure(format).unwrap();
+        output.push(PcmAudioFrame { format, pts: Some(Duration::from_secs(2)), frames: 4800,
+            samples: vec![0.0; 9600] }).unwrap();
+        assert!(!start_ready_audio_output(&mut output, true, false).unwrap(), "reset starts with normal prefill");
+    }
+
+    #[test]
+    fn enhancement_deadline_waits_for_readiness_without_early_or_paused_activation() {
+        let frame = AsyncVideoOutput { generation: 3, token: 10, pts: Duration::from_secs(2), duration: Duration::from_millis(40) };
+        let next = AsyncVideoOutput { token: 11, pts: frame.pts + frame.duration, ..frame };
+        assert!(enhancement_hold_required(None, None, Duration::ZERO, false));
+        assert!(!enhancement_hold_required(Some(frame), None, frame.pts, false));
+        assert!(enhancement_hold_required(Some(frame), None, next.pts, false));
+        assert!(!enhancement_hold_required(Some(frame), Some(next), next.pts, false));
+        assert!(!enhancement_hold_required(Some(frame), None, next.pts, true), "EOF must release the internal hold");
+        assert!(!enhancement_activation_due(Some(frame), next, true, frame.pts));
+        assert!(enhancement_activation_due(Some(frame), next, true, next.pts));
+        assert!(!enhancement_activation_due(Some(frame), next, false, next.pts));
+        assert!(enhancement_activation_due(None, next, false, next.pts), "one paused seek preview can activate");
+    }
+
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct CapturedComposition {

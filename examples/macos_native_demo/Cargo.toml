@@ -10,6 +10,7 @@ build = "build.rs"
 
 [dependencies]
 crossbeam-channel.workspace = true
+serde_json.workspace = true
 erika = { path = "../../crates/erika" }
 
 [features]

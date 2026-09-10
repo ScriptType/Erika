@@ -25,6 +25,8 @@ use crate::trace;
 
 #[derive(Debug, Error)]
 pub enum PlaybackError {
+    #[error("asynchronous enhancement protocol: {0}")]
+    Enhancement(String),
     #[error("ffmpeg error: {0}")]
     Ffmpeg(#[from] ffmpeg::FfmpegError),
     #[error("source error: {0}")]
@@ -4120,6 +4122,42 @@ pub struct TimedSubtitleFrame {
     pub late_by: Option<Duration>,
 }
 
+/// Cursor validation for the opt-in asynchronous renderer. Repeated reads are
+/// valid stopped positions, but silence/zero-read callbacks cannot advance it.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct EnhancementAudioClock {
+    previous: Option<(AudioClockSnapshot, u64, Instant)>,
+}
+
+pub(crate) fn enhancement_pcm_progress_is_monotonic(before: AudioClockSnapshot, after: AudioClockSnapshot) -> bool {
+    let (Some(old), Some(new)) = (before.media_time, after.media_time) else { return false; };
+    after.read_frames <= after.written_frames && before.read_frames <= before.written_frames
+        && after.read_frames >= before.read_frames && after.written_frames >= before.written_frames
+        && new >= old && (after.read_frames != before.read_frames || new == old)
+        && (after.read_frames == before.read_frames || new > old)
+}
+
+impl EnhancementAudioClock {
+    pub(crate) fn observe(&mut self, snapshot: AudioClockSnapshot, epoch: u64,
+        captured_at: Instant, floor: Duration) -> Option<Duration> {
+        let media = snapshot.media_time?;
+        if media < floor || snapshot.read_frames > snapshot.written_frames { return None; }
+        if let Some((previous, old_epoch, old_at)) = self.previous {
+            if epoch < old_epoch || captured_at <= old_at { return None; }
+            if epoch == old_epoch {
+                let old_media = previous.media_time?;
+                if snapshot.read_frames < previous.read_frames || media < old_media
+                    || (snapshot.read_frames == previous.read_frames && media != old_media)
+                    || (snapshot.read_frames > previous.read_frames && media <= old_media) {
+                    return None;
+                }
+            }
+        }
+        self.previous = Some((snapshot, epoch, captured_at));
+        Some(media)
+    }
+}
+
 pub struct VideoPlaybackEngine {
     session: PlaybackSession,
     state: PlaybackRunState,
@@ -4150,6 +4188,14 @@ pub struct VideoPlaybackEngine {
     video_seek_preroll_started_at: Option<Instant>,
     video_seek_preroll_dropped_frames: u64,
     last_video_seek_preroll_log: Option<Instant>,
+    async_video: bool,
+    enhancement_held: bool,
+    enhancement_token: u64,
+    enhancement_pending: Option<u64>,
+    enhancement_final_end: Option<Duration>,
+    enhancement_audio_clock: EnhancementAudioClock,
+    enhancement_audio_unavailable: bool,
+    enhancement_audio_unavailable_cursor: Option<(u64, u64)>,
 }
 
 impl VideoPlaybackEngine {
@@ -4169,6 +4215,7 @@ impl VideoPlaybackEngine {
             self.pending_audio = None;
             self.pending_subtitle = None;
             self.last_presented_pts = None;
+            self.reset_enhancement_credit();
             self.waiting_for_first_frame = true;
             self.video_seek_floor = resume_position;
             // Audio already handed to the output remains queued while video
@@ -4268,6 +4315,14 @@ impl VideoPlaybackEngine {
             video_seek_preroll_started_at: None,
             video_seek_preroll_dropped_frames: 0,
             last_video_seek_preroll_log: None,
+            async_video: false,
+            enhancement_held: false,
+            enhancement_token: 0,
+            enhancement_pending: None,
+            enhancement_final_end: None,
+            enhancement_audio_clock: EnhancementAudioClock::default(),
+            enhancement_audio_unavailable: false,
+            enhancement_audio_unavailable_cursor: None,
         }
     }
 
@@ -4507,6 +4562,7 @@ impl VideoPlaybackEngine {
         self.reset_audio_clock_tracking(media_time);
         trace_clock_reset("reset_streams_at", before, media_time, self.state);
         self.last_presented_pts = None;
+        self.reset_enhancement_credit();
         self.eof = false;
         self.buffering = false;
         self.buffering_video_pts = None;
@@ -4522,6 +4578,176 @@ impl VideoPlaybackEngine {
 
     pub fn state(&self) -> PlaybackRunState {
         self.state
+    }
+
+    pub(crate) fn uses_async_video_clock(&self) -> bool { self.async_video }
+
+    pub(crate) fn pending_enhancement_token(&self) -> Option<u64> { self.enhancement_pending }
+
+    pub(crate) fn async_video_eof(&self) -> bool {
+        self.async_video && self.enhancement_pending.is_none() && self.pending_frame.is_none()
+            && self.session.demux_eof && !self.session.has_queued_video_frames()
+            && self.session.video_decoder.as_ref().is_none_or(Decoder::is_end_of_stream)
+    }
+
+    pub(crate) fn set_async_video_clock(&mut self, enabled: bool) {
+        if self.async_video == enabled { return; }
+        self.async_video = enabled;
+        self.reset_enhancement_credit();
+        if !enabled && self.state == PlaybackRunState::Playing && !self.buffering {
+            self.clock.play(Instant::now());
+        }
+    }
+
+    fn reset_enhancement_credit(&mut self) {
+        let was_active = self.async_video || self.enhancement_held || self.enhancement_pending.is_some();
+        self.enhancement_pending = None;
+        self.enhancement_final_end = None;
+        self.enhancement_audio_clock = EnhancementAudioClock::default();
+        self.enhancement_audio_unavailable = false;
+        self.enhancement_audio_unavailable_cursor = None;
+        self.enhancement_held = self.async_video;
+        if self.enhancement_held { self.clock.pause(Instant::now()); }
+        if was_active { self.last_audio_clock_sample = None; }
+    }
+
+    pub(crate) fn enhancement_feedback(
+        &mut self, activated: Option<(u64, Duration, Duration)>, held: bool, now: Instant,
+    ) -> bool {
+        if !self.async_video { return false; }
+        if let Some((token, pts, duration)) = activated {
+            if self.enhancement_pending != Some(token) { return false; }
+            self.enhancement_pending = None;
+            self.enhancement_final_end = Some(pts.saturating_add(duration));
+            if self.last_presented_pts.is_none() {
+                self.clock.reset(pts, false, now);
+                // Keep the actual seek/audio floor: the first video PTS can
+                // legitimately follow the first retained PCM by a few ms.
+                self.reset_audio_clock_tracking(self.audio_clock_floor);
+            }
+            self.last_presented_pts = Some(pts);
+            if self.buffering { self.buffering_video_pts = Some(pts); }
+            self.waiting_for_first_frame = false;
+        }
+        self.enhancement_held = held;
+        self.last_audio_clock_sample = None;
+        if held || self.state != PlaybackRunState::Playing || self.buffering {
+            self.clock.pause(now);
+        } else if self.last_presented_pts.is_some() {
+            self.clock.play(now);
+        }
+        true
+    }
+
+    pub(crate) fn reconcile_enhancement_audio(&mut self, snapshot: AudioClockSnapshot,
+        captured_at: Instant, output_epoch: u64, now: Instant) -> bool {
+        self.reconcile_enhancement_audio_after_pause(snapshot, captured_at, output_epoch, now, None)
+    }
+
+    pub(crate) fn reconcile_enhancement_audio_after_pause(&mut self, snapshot: AudioClockSnapshot,
+        captured_at: Instant, output_epoch: u64, now: Instant,
+        pause_continuity: Option<(u64, AudioClockSnapshot)>) -> bool {
+        if !self.async_video || self.state != PlaybackRunState::Playing { return false; }
+        if snapshot.read_frames > snapshot.written_frames { return false; }
+        if let Some((from_epoch, before)) = pause_continuity {
+            // The core admits this proof only with the fresh current post-pause
+            // identity. Retain pre-pause read counts, including skipped bridges.
+            if from_epoch < output_epoch && enhancement_pcm_progress_is_monotonic(before, snapshot) {
+                if let Some((old, epoch, at)) = self.enhancement_audio_clock.previous {
+                    if (from_epoch..output_epoch).contains(&epoch)
+                        && enhancement_pcm_progress_is_monotonic(old, before) {
+                        self.enhancement_audio_clock.previous = Some((old, output_epoch, at));
+                    }
+                }
+                if let Some((epoch, reads)) = self.enhancement_audio_unavailable_cursor {
+                    if (from_epoch..output_epoch).contains(&epoch) && reads <= before.read_frames {
+                        self.enhancement_audio_unavailable_cursor = Some((output_epoch, reads));
+                    }
+                }
+            }
+        }
+        let output_empty = snapshot.queued_frames == 0
+            && snapshot.queued_duration.is_none_or(|value| value.is_zero());
+        // Keep an established gap through worker-to-output handoff. An empty
+        // old cursor must not rewind the fallback clock as pending PCM becomes
+        // due. Pushing PCM changes the ring's front PTS before consumption, so
+        // only an accepted new same-epoch read can retire this established gap.
+        if self.enhancement_audio_unavailable {
+            if let Some((old_epoch, old_read)) = self.enhancement_audio_unavailable_cursor {
+                if old_epoch != output_epoch {
+                    self.enhancement_audio_unavailable_cursor = Some((output_epoch, snapshot.read_frames));
+                    return false;
+                }
+                if snapshot.read_frames <= old_read { return false; }
+            }
+        }
+        let mut observed_clock = self.enhancement_audio_clock;
+        let accepted_media = observed_clock.observe(snapshot, output_epoch, captured_at, self.audio_clock_floor);
+        // Classify a future gap relative to valid actual audio when it is ahead
+        // of the parked worker clock. Contiguous PCM is not a future gap merely
+        // because feedback/worker buffering left wall time behind consumption.
+        let gap_reference = accepted_media.map_or(self.media_time_at(now), |media| media.max(self.media_time_at(now)));
+        let future_audio = self.pending_audio.as_ref().and_then(|frame| frame.pts)
+            .is_some_and(|pts| pts > gap_reference
+                && self.session.audio_frames.iter().all(|frame| frame.pts.is_some_and(|queued| queued >= pts))
+                && (self.session.buffering_audio_recovery_suspended
+                    || pts > gap_reference + self.effective_audio_lead()));
+        let audio_empty = (self.pending_audio.is_none() && !self.session.has_queued_audio_frames()) || future_audio;
+        if output_empty && audio_empty && future_audio {
+            self.session.suspend_buffering_audio_recovery("future_audio_frame",
+                "empty output; retained pending PCM begins beyond bounded lead (temporary gap, not EOF)".into());
+        }
+        let lookahead_blocked = !self.session.video_decode_suspended
+            && self.session.video_frames.len() >= self.session.active_video_frame_queue_limit()
+            && self.session.pending_video_packets.len() >= AUDIO_DEMAND_PENDING_VIDEO_PACKET_LIMIT;
+        if output_empty && audio_empty && lookahead_blocked {
+            self.session.suspend_buffering_audio_recovery("bounded_video_backpressure",
+                "empty audio output and audio queues; no-drop audio lookahead reached both bounded video queue limits (temporary unavailability, not EOF)".into());
+        }
+        let audio_unavailable = output_empty && audio_empty
+            && (self.session.audio_decoder_is_eof() || self.session.buffering_audio_recovery_suspended);
+        if audio_unavailable {
+            self.trace_enhancement_audio_transition(true, snapshot, output_epoch, accepted_media, gap_reference, future_audio);
+            self.enhancement_audio_unavailable = true;
+            self.enhancement_audio_unavailable_cursor = Some((output_epoch, snapshot.read_frames));
+            return false;
+        }
+        let Some(media) = accepted_media else { return false; };
+        self.enhancement_audio_clock = observed_clock;
+        self.trace_enhancement_audio_transition(false, snapshot, output_epoch, accepted_media, gap_reference, future_audio);
+        self.enhancement_audio_unavailable = false;
+        self.enhancement_audio_unavailable_cursor = None;
+        // This is the actual PCM cursor after pause (or a fresh running read),
+        // not a wall deadline and not the ordinary coarse drift-correction path.
+        self.clock.sync_to(media, now, PlaybackClockSource::Audio);
+        if self.buffering && self.last_presented_pts.is_some() { self.buffering_video_pts = Some(media); }
+        if self.enhancement_held || self.buffering { self.clock.pause(now); }
+        true
+    }
+
+    fn trace_enhancement_audio_transition(&self, unavailable: bool, snapshot: AudioClockSnapshot,
+        output_epoch: u64, accepted_media: Option<Duration>, gap_reference: Duration, future_audio: bool) {
+        if unavailable == self.enhancement_audio_unavailable
+            || std::env::var("ERIKA_ADAPTER_DIAGNOSTICS").as_deref() != Ok("1") { return; }
+        trace::diagnostic(serde_json::json!({"event":"enhancement_audio_authority",
+            "unavailable":unavailable,"outputEpoch":output_epoch,"readFrames":snapshot.read_frames,
+            "writtenFrames":snapshot.written_frames,"queuedFrames":snapshot.queued_frames,
+            "audioSeconds":snapshot.media_time.map(|v|v.as_secs_f64()),
+            "acceptedAudioSeconds":accepted_media.map(|v|v.as_secs_f64()),
+            "workerSeconds":self.media_time().as_secs_f64(),"gapReferenceSeconds":gap_reference.as_secs_f64(),
+            "pendingAudioSeconds":self.pending_audio.as_ref().and_then(|v|v.pts).map(|v|v.as_secs_f64()),
+            "audioFloorSeconds":self.audio_clock_floor.as_secs_f64(),"futureAudio":future_audio,
+            "decoderEOF":self.session.audio_decoder_is_eof(),
+            "lookaheadSuspended":self.session.buffering_audio_recovery_suspended}).to_string());
+    }
+
+    pub(crate) fn enhancement_audio_unavailable(&self) -> bool {
+        self.async_video && self.enhancement_audio_unavailable
+    }
+
+    fn effective_audio_lead(&self) -> Duration {
+        if self.async_video { self.timing.audio_lead_time.max(Duration::from_millis(250)) }
+        else { self.timing.audio_lead_time }
     }
 
     pub(crate) fn is_buffering(&self) -> bool {
@@ -4560,10 +4786,15 @@ impl VideoPlaybackEngine {
         }
         let media_time = self.clock.media_time_at(now);
         self.clock.pause(now);
-        self.session.begin_buffering_audio_video_scan(media_time);
+        if !self.async_video { self.session.begin_buffering_audio_video_scan(media_time); }
         self.last_audio_clock_sample = None;
         self.buffering = true;
-        self.buffering_video_pts = None;
+        // An activated async frame remains displayable while its successor is
+        // prepared. Recover from the parked timeline without rewinding to that
+        // frame's start or waiting cyclically for the future frame to activate.
+        self.buffering_video_pts = if self.async_video {
+            self.last_presented_pts.map(|_| media_time)
+        } else { None };
         self.last_buffering_video_drain_at = None;
         self.buffering_video_drained_frames = 0;
         trace::log(format!(
@@ -4579,7 +4810,7 @@ impl VideoPlaybackEngine {
         source: PlaybackClockSource,
         now: Instant,
     ) -> bool {
-        if self.state != PlaybackRunState::Playing || !self.buffering {
+        if self.state != PlaybackRunState::Playing || !self.buffering || self.enhancement_held {
             return false;
         }
         let before = self.clock.media_time_at(now);
@@ -4702,7 +4933,7 @@ impl VideoPlaybackEngine {
     fn start_playback_at(&mut self, now: Instant) {
         let before = self.clock.media_time_at(now);
         let waiting_for_first_frame = self.last_presented_pts.is_none();
-        if !waiting_for_first_frame {
+        if !waiting_for_first_frame && !self.enhancement_held {
             self.clock.play(now);
         }
         trace::log(format!(
@@ -4794,6 +5025,7 @@ impl VideoPlaybackEngine {
         self.pending_audio = None;
         self.pending_subtitle = None;
         self.last_presented_pts = None;
+        self.reset_enhancement_credit();
         self.state = PlaybackRunState::Stopped;
         self.eof = false;
         self.waiting_for_first_frame = false;
@@ -4855,6 +5087,7 @@ impl VideoPlaybackEngine {
         self.reset_audio_clock_tracking(position);
         trace_clock_reset("seek", before, position, state_after);
         self.last_presented_pts = None;
+        self.reset_enhancement_credit();
         self.eof = false;
         self.state = state_after;
         self.buffering = false;
@@ -4991,7 +5224,7 @@ impl VideoPlaybackEngine {
         captured_at: Instant,
         now: Instant,
     ) -> Option<ClockCorrection> {
-        if self.state != PlaybackRunState::Playing || self.buffering || !self.clock.is_running() {
+        if self.async_video || self.state != PlaybackRunState::Playing || self.buffering || !self.clock.is_running() {
             return None;
         }
         let elapsed = now.checked_duration_since(captured_at)?;
@@ -5084,7 +5317,11 @@ impl VideoPlaybackEngine {
         let pts = frame.pts;
         let now = now();
         let media_time = self.clock.media_time_at(now);
-        if pts.is_some_and(|pts| pts > media_time + self.timing.audio_lead_time) {
+        if pts.is_some_and(|pts| pts > media_time + self.effective_audio_lead()
+            || (self.async_video && self.enhancement_audio_unavailable && pts > media_time)) {
+            // A declared future-audio gap must keep its PCM out of the output
+            // ring until the timeline reaches that source PTS. The ring exposes
+            // the next queued segment's cursor even before it has been read.
             if self.buffering || self.session.buffering_audio_recovery_suspended {
                 self.session.suspend_buffering_audio_recovery(
                     "future_audio_frame",
@@ -5125,7 +5362,11 @@ impl VideoPlaybackEngine {
         let pts = frame.pts;
         let now = Instant::now();
         let media_time = self.clock.media_time_at(now);
-        if pts.is_some_and(|pts| pts > media_time + self.timing.audio_lead_time) {
+        if pts.is_some_and(|pts| pts > media_time + self.effective_audio_lead()
+            || (self.async_video && self.enhancement_audio_unavailable && pts > media_time)) {
+            // A declared future-audio gap must keep its PCM out of the output
+            // ring until the timeline reaches that source PTS. The ring exposes
+            // the next queued segment's cursor even before it has been read.
             if self.buffering || self.session.buffering_audio_recovery_suspended {
                 self.session.suspend_buffering_audio_recovery(
                     "future_audio_frame",
@@ -5206,7 +5447,8 @@ impl VideoPlaybackEngine {
         if self.state != PlaybackRunState::Playing && !paused_seek_preview {
             return Ok(None);
         }
-        if self.buffering && self.buffering_video_pts.is_some() {
+        if self.async_video && self.enhancement_pending.is_some() { return Ok(None); }
+        if !self.async_video && self.buffering && self.buffering_video_pts.is_some() {
             // The first buffering frame remains visible in the presenter, but
             // interleaved audio cannot refill unless video demux keeps moving.
             // Pace later drains instead of consuming one frame per 2 ms worker
@@ -5276,6 +5518,21 @@ impl VideoPlaybackEngine {
                 continue;
             }
             let should_present_first = self.last_presented_pts.is_none();
+            if self.async_video {
+                // Decode one next input ahead of presentation, including while
+                // held. Its token remains occupied until matching activation.
+                // Seek preroll above is preserved; ordinary late-frame dropping
+                // below does not apply to enhancement-driven Adaptive playback.
+                self.enhancement_token = self.enhancement_token.checked_add(1)
+                    .ok_or_else(|| PlaybackError::Enhancement("video token exhausted".into()))?;
+                self.enhancement_pending = Some(self.enhancement_token);
+                let frame = self.pending_frame.take().expect("pending frame exists");
+                if paused_seek_preview { self.paused_seek_frame_pending = false; }
+                return Ok(Some(TimedVideoFrame {
+                    frame: frame.frame, decode_backend: frame.decode_backend, pts,
+                    media_time: self.media_time_at(now()), late_by: None,
+                }));
+            }
             if should_present_first && self.waiting_for_first_frame {
                 let now = now();
                 let before = self.clock.media_time_at(now);
@@ -5501,6 +5758,13 @@ impl VideoPlaybackEngine {
             ) {
                 return Ok(());
             }
+            if self.async_video && self.enhancement_final_end.is_some_and(|end| {
+                self.media_time_at(now()) < end.max(self.last_audio_output_end.unwrap_or(end))
+            }) {
+                // A decoded EOF is not permission to finish before the final
+                // activated frame interval and already handed-off PCM timeline.
+                return Ok(());
+            }
             self.eof = true;
             self.state = PlaybackRunState::Ended;
             self.buffering = false;
@@ -5594,7 +5858,7 @@ impl VideoPlaybackEngine {
             return Ok(());
         }
         let audio_seek_floor = &mut self.audio_seek_floor;
-        let demand = if self.buffering {
+        let demand = if self.buffering && !self.async_video {
             PlaybackPumpDemand::BufferingAudio
         } else {
             PlaybackPumpDemand::Audio
@@ -7697,6 +7961,444 @@ mod tests {
             clock.media_time_at(pause_time + Duration::from_secs(60)),
             Duration::from_millis(10_500)
         );
+    }
+
+    #[test]
+    fn enhancement_quantized_pcm_holds_do_not_accumulate_wall_clock_lead() {
+        let mut engine = playback_fixture_engine();
+        engine.set_async_video_clock(true);
+        let mut now = Instant::now();
+        engine.play_at(now);
+        let first = next_fixture_video_at(&mut engine, now);
+        let mut current = crate::core::AsyncVideoOutput { generation: 1,
+            token: engine.pending_enhancement_token().unwrap(), pts: first.pts.unwrap(),
+            duration: Duration::from_nanos(33_333_333) };
+        assert!(engine.enhancement_feedback(Some((current.token, current.pts, current.duration)), false, now));
+        let mut reads = 0_u64;
+        let mut epoch = 1;
+        let mut cursor = Duration::ZERO;
+        let sample = |reads| AudioClockSnapshot { media_time: Some(Duration::from_secs_f64(reads as f64 / 48_000.0)),
+            queued_duration: Some(Duration::from_millis(500)), queued_frames: 24_000,
+            read_frames: reads, written_frames: 384_000, underflow_frames: 0 };
+        let mut extra_quanta = 0;
+        let mut source_pts = vec![current.pts];
+        for _ in 0..36 {
+            let frame = next_fixture_video_at(&mut engine, now);
+            let next = crate::core::AsyncVideoOutput { token: engine.pending_enhancement_token().unwrap(),
+                pts: frame.pts.unwrap(), ..current };
+            source_pts.push(next.pts);
+            // Actual failed-run pattern: 33/34ms media frame, 33.333ms wall
+            // slice, but only1280/48000 seconds of PCM consumed after restart.
+            now += Duration::from_nanos(33_333_333);
+            reads += 1280;
+            assert!(engine.reconcile_enhancement_audio(sample(reads), now, epoch, now));
+            cursor = sample(reads).media_time.unwrap();
+            while !crate::presenter::enhancement_activation_due(Some(current), next, true, cursor) {
+                // Preserve every sample/frame. Wait for real callback progress
+                // instead of advancing the source sequence by the wall clock.
+                reads += 256;
+                extra_quanta += 1;
+                now += Duration::from_secs_f64(256.0 / 48_000.0);
+                assert!(engine.reconcile_enhancement_audio(sample(reads), now, epoch, now));
+                cursor = sample(reads).media_time.unwrap();
+            }
+            assert!(duration_difference(next.pts, cursor) <= Duration::from_secs_f64(256.0 / 48_000.0));
+            assert!(engine.enhancement_feedback(None, true, now));
+            epoch += 1;
+            now += Duration::from_micros(1);
+            assert!(engine.reconcile_enhancement_audio(sample(reads), now, epoch, now));
+            assert_eq!(engine.media_time_at(now + Duration::from_millis(500)), cursor);
+            now += Duration::from_millis(500);
+            assert!(engine.enhancement_feedback(Some((next.token, next.pts, next.duration)), false, now));
+            assert!(engine.reconcile_enhancement_audio(sample(reads), now, epoch, now));
+            current = next;
+        }
+        assert!(extra_quanta >= 36, "short audio slices need real additional PCM, not wall time");
+        assert!(source_pts.windows(2).all(|p| matches!((p[1]-p[0]).as_millis(), 33 | 34)));
+        assert_eq!(source_pts.last().copied(), Some(Duration::from_millis(1200)));
+        engine.pause_at(now);
+        assert!(!engine.reconcile_enhancement_audio(sample(reads+256), now+Duration::from_millis(10), epoch, now+Duration::from_millis(10)));
+        assert_eq!(engine.media_time_at(now+Duration::from_secs(10)), cursor);
+    }
+
+    #[test]
+    fn enhancement_audio_cursor_rejects_regression_stale_epoch_and_fake_underflow_progress() {
+        let mut clock = EnhancementAudioClock::default();
+        let now = Instant::now();
+        let first = AudioClockSnapshot { media_time: Some(Duration::ZERO), queued_duration: Some(Duration::from_millis(100)),
+            queued_frames: 4800, read_frames: 0, written_frames: 4800, underflow_frames: 0 };
+        assert_eq!(clock.observe(first, 2, now, Duration::ZERO), Some(Duration::ZERO));
+        let silent = AudioClockSnapshot { underflow_frames: 512, ..first };
+        assert_eq!(clock.observe(silent, 2, now+Duration::from_millis(1), Duration::ZERO), Some(Duration::ZERO));
+        assert!(clock.observe(AudioClockSnapshot { media_time: Some(Duration::from_millis(10)), ..silent },
+            2, now+Duration::from_millis(2), Duration::ZERO).is_none());
+        let read = AudioClockSnapshot { media_time: Some(Duration::from_millis(10)), read_frames: 480, ..first };
+        assert_eq!(clock.observe(read, 2, now+Duration::from_millis(3), Duration::ZERO), read.media_time);
+        assert!(clock.observe(first, 2, now+Duration::from_millis(4), Duration::ZERO).is_none());
+        assert!(clock.observe(read, 1, now+Duration::from_millis(5), Duration::ZERO).is_none());
+        assert!(clock.observe(read, 2, now, Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn enhancement_startup_prefills_actual_pcm_without_advancing_clock_or_video_credit() {
+        use crate::audio::{AudioOutputBackend, AudioRingBufferConfig, BufferedAudioOutput};
+        let mut engine = playback_fixture_engine();
+        assert_eq!(engine.effective_audio_lead(), Duration::from_millis(120));
+        engine.set_async_video_clock(true);
+        assert_eq!(engine.effective_audio_lead(), Duration::from_millis(250));
+        let now = Instant::now();
+        engine.play_at(now);
+        let _first = next_fixture_video_at(&mut engine, now);
+        let token = engine.pending_enhancement_token();
+        let mut output = BufferedAudioOutput::new(AudioRingBufferConfig::default());
+        let mut channels = 0;
+        let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+        while output.clock_snapshot().queued_duration.unwrap_or_default() < Duration::from_millis(250) {
+            if let Some(frame) = engine.tick_audio_at(now).unwrap() {
+                if channels == 0 { channels = frame.frame.format.channels as usize; output.configure(frame.frame.format).unwrap(); }
+                output.push(frame.frame).unwrap();
+            }
+            assert!(Instant::now() < deadline, "bounded parked prefill could not reach startup threshold");
+            thread::yield_now();
+        }
+        assert_eq!(output.clock_snapshot().read_frames, 0);
+        assert!(!engine.clock.is_running());
+        assert_eq!(engine.pending_enhancement_token(), token);
+        output.start().unwrap();
+        output.read_interleaved(&mut vec![0.0; 256*channels]).unwrap();
+        assert_eq!(output.clock_snapshot().read_frames, 256);
+        engine.set_async_video_clock(false);
+        assert_eq!(engine.effective_audio_lead(), Duration::from_millis(120));
+    }
+
+    #[test]
+    fn enhancement_empty_audio_requires_bounded_lookahead_or_decoder_exhaustion_for_fallback() {
+        let mut engine = playback_fixture_engine();
+        engine.set_async_video_clock(true);
+        let now = Instant::now(); engine.play_at(now);
+        let empty = AudioClockSnapshot { media_time: None, queued_duration: None, queued_frames: 0,
+            read_frames: 0, written_frames: 0, underflow_frames: 512 };
+        engine.reconcile_enhancement_audio(empty, now, 1, now);
+        assert!(!engine.enhancement_audio_unavailable(), "underflow alone is not absence");
+        let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+        while engine.session.pending_video_packets.len() < AUDIO_DEMAND_PENDING_VIDEO_PACKET_LIMIT {
+            engine.session.audio_frames.clear();
+            let _ = engine.session.pump_once(PlaybackPumpDemand::Audio).unwrap();
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        engine.session.audio_frames.clear();
+        let before = (engine.session.video_frames.len(), engine.session.pending_video_packets.len());
+        engine.audio_clock_floor = Duration::from_secs(1);
+        let below_floor_empty = AudioClockSnapshot { media_time: Some(Duration::from_millis(500)),
+            read_frames: 24_000, written_frames: 24_000, ..empty };
+        let parked = engine.media_time_at(now);
+        engine.reconcile_enhancement_audio(below_floor_empty, now+Duration::from_millis(1), 1, now+Duration::from_millis(1));
+        assert!(engine.enhancement_audio_unavailable(), "proven absence remains valid when audio ends before video seek floor");
+        assert_eq!(engine.media_time_at(now), parked, "inadmissible cursor never anchors clock");
+        assert!(!engine.session.demux_eof, "this is temporary absence, not EOF");
+        assert_eq!(before, (engine.session.video_frames.len(), engine.session.pending_video_packets.len()));
+        assert_eq!(engine.session.buffering_audio_video_scan.discarded_frames, 0);
+        engine.audio_clock_floor = Duration::ZERO;
+        engine.session.audio_frames.push_back(pcm_frame(Duration::ZERO, 480));
+        assert!(engine.tick_audio_at(now).unwrap().is_some());
+        let restored = AudioClockSnapshot { media_time: Some(Duration::from_secs_f64(24_001.0/48_000.0)), queued_duration: Some(Duration::from_millis(10)),
+            queued_frames: 480, read_frames: 24_001, written_frames: 24_481, underflow_frames: 512 };
+        engine.reconcile_enhancement_audio(restored, now+Duration::from_millis(2), 1, now+Duration::from_millis(2));
+        assert!(!engine.enhancement_audio_unavailable());
+    }
+
+    #[test]
+    fn enhancement_known_future_audio_gap_releases_wall_clock_without_discarding_pcm() {
+        use crate::audio::{AudioOutputBackend, AudioRingBufferConfig, BufferedAudioOutput};
+        let mut engine = playback_fixture_engine();
+        engine.set_async_video_clock(true);
+        let now = Instant::now(); engine.play_at(now);
+        let first = next_fixture_video_at(&mut engine, now);
+        let token = engine.pending_enhancement_token().unwrap();
+        engine.enhancement_feedback(Some((token, first.pts.unwrap(), Duration::from_millis(33))), false, now);
+        engine.session.audio_frames.clear();
+        let pcm = |pts| {
+            let mut frame = pcm_frame(pts, 480);
+            frame.format = PcmFormat::f32_interleaved(48_000, 2);
+            frame
+        };
+        let mut output = BufferedAudioOutput::new(AudioRingBufferConfig::default());
+        let initial = pcm(Duration::ZERO);
+        output.configure(initial.format).unwrap();
+        output.push(initial).unwrap();
+        output.start().unwrap();
+        output.read_interleaved(&mut vec![0.0; 480*2]).unwrap();
+        let empty = output.clock_snapshot();
+        assert_eq!(empty.read_frames, 480);
+        assert_eq!(empty.media_time, Some(Duration::from_millis(10)));
+        assert!(engine.reconcile_enhancement_audio(empty, now, 1, now), "establish consumed audio cursor before gap");
+        engine.pending_audio = Some(pcm(Duration::from_secs(10)));
+        engine.session.audio_frames.push_back(pcm(Duration::from_secs(11)));
+        let queued_samples = engine.session.audio_frames.front().unwrap().samples.clone();
+        let original_samples = engine.pending_audio.as_ref().unwrap().samples.clone();
+        engine.reconcile_enhancement_audio(empty, now+Duration::from_micros(1), 1, now+Duration::from_micros(1));
+        assert!(engine.enhancement_audio_unavailable());
+        assert!(engine.clock.is_running());
+        assert!(!engine.session.demux_eof);
+        assert_eq!(engine.pending_audio.as_ref().unwrap().pts, Some(Duration::from_secs(10)));
+        assert_eq!(engine.pending_audio.as_ref().unwrap().samples, original_samples);
+        assert_eq!(engine.session.audio_frames.front().unwrap().samples, queued_samples);
+        assert_eq!(engine.session.audio_frames.front().unwrap().pts, Some(Duration::from_secs(11)));
+        assert_eq!(engine.session.buffering_audio_video_scan.discarded_frames, 0);
+        engine.clock.sync_to(Duration::from_millis(9900), now, PlaybackClockSource::Wall);
+        engine.reconcile_enhancement_audio(empty, now+Duration::from_micros(2), 1, now+Duration::from_micros(2));
+        assert!(engine.enhancement_audio_unavailable(), "pending future PCM keeps gap open inside ordinary prefill lead");
+        assert_eq!(engine.media_time_at(now), Duration::from_millis(9900), "old stopped cursor cannot rewind fallback");
+        assert!(engine.tick_audio_at(now).unwrap().is_none(), "future PCM must not start100ms early");
+        assert_eq!(engine.pending_audio.as_ref().unwrap().samples, original_samples);
+        engine.clock.sync_to(Duration::from_secs(10), now, PlaybackClockSource::Wall);
+        engine.reconcile_enhancement_audio(empty, now+Duration::from_micros(3), 1, now+Duration::from_micros(3));
+        assert_eq!(engine.media_time_at(now), Duration::from_secs(10));
+        let resumed = engine.tick_audio_at(now).unwrap().unwrap();
+        assert_eq!(resumed.pts, Some(Duration::from_secs(10)));
+        assert_eq!(resumed.frame.samples, original_samples);
+        engine.reconcile_enhancement_audio(empty, now+Duration::from_micros(4), 1, now+Duration::from_micros(4));
+        assert!(engine.enhancement_audio_unavailable(), "retain fallback while actual PCM is in handoff");
+        assert_eq!(engine.media_time_at(now), Duration::from_secs(10));
+        output.push(resumed.frame).unwrap();
+        let queued = output.clock_snapshot();
+        assert_eq!(queued.read_frames, empty.read_frames);
+        assert_eq!(queued.media_time, Some(Duration::from_secs(10)), "ring front advances on push before consumption");
+        assert!(!engine.reconcile_enhancement_audio(queued, now+Duration::from_millis(1), 1, now+Duration::from_millis(1)));
+        assert!(engine.enhancement_audio_unavailable(), "unread PCM cannot retire established fallback");
+        assert!(engine.clock.is_running(), "wall fallback remains able to reach startup and internal-hold resume");
+        assert_eq!(engine.media_time_at(now), Duration::from_secs(10));
+        output.read_interleaved(&mut vec![0.0; 256*2]).unwrap();
+        let consumed = output.clock_snapshot();
+        assert_eq!(consumed.read_frames, empty.read_frames+256);
+        assert!(engine.reconcile_enhancement_audio(consumed, now+Duration::from_millis(2), 1, now+Duration::from_millis(2)));
+        assert!(!engine.enhancement_audio_unavailable());
+        assert_eq!(engine.media_time_at(now+Duration::from_millis(2)), consumed.media_time.unwrap());
+    }
+
+    #[test]
+    fn enhancement_actual_audio_prevents_false_future_gap_from_parked_worker() {
+        let mut engine = playback_fixture_engine();
+        engine.set_async_video_clock(true);
+        let now = Instant::now(); engine.play_at(now);
+        engine.seek_at(Duration::from_millis(730), now);
+        let first = next_fixture_video_at(&mut engine, now);
+        let token = engine.pending_enhancement_token().unwrap();
+        assert_eq!(first.pts, Some(Duration::from_millis(733)));
+        engine.enhancement_feedback(Some((token, first.pts.unwrap(), Duration::from_millis(33))), false, now);
+        assert_eq!(engine.audio_clock_floor, Duration::from_millis(730), "first video must not raise the seek/audio floor");
+        let initial = AudioClockSnapshot { media_time: Some(Duration::from_nanos(730_020_822)),
+            read_frames: 0, written_frames: 12_000, queued_frames: 12_000,
+            queued_duration: Some(Duration::from_millis(250)), underflow_frames: 0 };
+        assert!(engine.reconcile_enhancement_audio(initial, now, 1, now));
+        engine.clock.sync_to(Duration::from_millis(733), now, PlaybackClockSource::Wall);
+        engine.session.audio_frames.clear();
+        engine.pending_audio = Some(pcm_frame(Duration::from_secs(1), 480));
+        let consumed = AudioClockSnapshot { media_time: Some(Duration::from_nanos(981_333_317)),
+            read_frames: 12_000, queued_frames: 0, queued_duration: Some(Duration::ZERO), ..initial };
+        assert!(engine.reconcile_enhancement_audio(consumed, now+Duration::from_millis(1), 1, now+Duration::from_millis(1)));
+        assert!(!engine.enhancement_audio_unavailable(), "next contiguous PCM is inside valid audio lead despite parked worker");
+        assert_eq!(engine.media_time_at(now+Duration::from_millis(1)), consumed.media_time.unwrap());
+        let queued_pts = engine.pending_audio.as_ref().unwrap().pts;
+        let read_stalled = AudioClockSnapshot { media_time: Some(Duration::from_secs(2)), ..consumed };
+        assert!(!engine.reconcile_enhancement_audio(read_stalled, now+Duration::from_millis(2), 1, now+Duration::from_millis(2)));
+        assert_eq!(engine.pending_audio.as_ref().unwrap().pts, queued_pts);
+        assert!(engine.media_time_at(now+Duration::from_millis(2)) < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn enhancement_pause_bridge_recovers_gap_on_first_resumed_callback_even_when_feedback_is_skipped() {
+        use crate::audio::{AudioOutputBackend, AudioRingBufferConfig, BufferedAudioOutput};
+        let mut engine = playback_fixture_engine();
+        engine.set_async_video_clock(true);
+        let mut now = Instant::now(); engine.play_at(now);
+        let format = PcmFormat::f32_interleaved(48_000, 2);
+        let mut output = BufferedAudioOutput::new(AudioRingBufferConfig::default());
+        output.configure(format).unwrap();
+        let mut epoch = 1;
+        for cycle in 0..12 {
+            engine.session.audio_frames.clear();
+            let target = Duration::from_secs(10+cycle);
+            engine.pending_audio = Some(PcmAudioFrame { format, pts: Some(target), frames: 1024, samples: vec![0.25;2048] });
+            let empty = output.clock_snapshot();
+            now += Duration::from_millis(1);
+            engine.reconcile_enhancement_audio(empty, now, epoch, now);
+            assert!(engine.enhancement_audio_unavailable());
+            engine.clock.sync_to(target, now, PlaybackClockSource::Wall);
+            let frame = engine.tick_audio_at(now).unwrap().unwrap();
+            output.push(frame.frame).unwrap();
+            output.start().unwrap();
+            let original_epoch = epoch;
+            let mut before = output.clock_snapshot();
+            // First cycle deliberately withholds one intermediate pause bridge.
+            for _ in 0..if cycle == 0 { 2 } else { 1 } {
+                output.read_interleaved(&mut vec![0.0;256*2]).unwrap();
+                before = output.clock_snapshot();
+                output.pause().unwrap();
+                epoch += 1;
+                output.start().unwrap();
+            }
+            output.pause().unwrap();
+            now += Duration::from_millis(1);
+            let after = output.clock_snapshot();
+            assert!(engine.reconcile_enhancement_audio_after_pause(after, now, epoch, now, Some((original_epoch, before))));
+            assert!(!engine.enhancement_audio_unavailable(), "pause must preserve the consumed read delta across its invalidation");
+            assert_eq!(engine.media_time_at(now), after.media_time.unwrap());
+            output.start().unwrap();
+            output.read_interleaved(&mut vec![0.0;after.queued_frames*2]).unwrap();
+        }
+        assert_eq!(output.clock_snapshot().read_frames, 12*1024);
+    }
+
+    #[test]
+    fn enhancement_ordered_catchup_keeps_audio_held_until_new_frame_contains_cursor() {
+        let mut engine = playback_fixture_engine();
+        engine.set_async_video_clock(true);
+        let now = Instant::now(); engine.play_at(now);
+        let audio = Duration::from_millis(150);
+        let mut source = Vec::new();
+        for _ in 0..5 {
+            let frame = next_fixture_video_at(&mut engine, now);
+            let current = crate::core::AsyncVideoOutput { generation: 1,
+                token: engine.pending_enhancement_token().unwrap(), pts: frame.pts.unwrap(),
+                duration: Duration::from_nanos(33_333_333) };
+            assert!(crate::presenter::enhancement_activation_due(None, current, true, audio));
+            let held = crate::presenter::enhancement_hold_required(Some(current), None, audio, false);
+            source.push(current.pts);
+            assert_eq!(held, source.len() < 5);
+            assert!(engine.enhancement_feedback(Some((current.token,current.pts,current.duration)), held, now));
+            engine.clock.sync_to(audio, now, PlaybackClockSource::Audio);
+            if held { engine.clock.pause(now); assert!(!engine.clock.is_running()); }
+        }
+        assert_eq!(source, [0,33,67,100,133].map(Duration::from_millis));
+        assert!(!engine.enhancement_held, "release only after ordered video catches actual PCM interval");
+    }
+
+    #[test]
+    fn enhancement_credit_waits_for_activation_and_rejects_duplicate() {
+        let mut engine = playback_fixture_engine();
+        engine.set_async_video_clock(true);
+        let t0 = Instant::now();
+        engine.play_at(t0);
+        let first = next_fixture_video_at(&mut engine, t0);
+        let token = engine.pending_enhancement_token().unwrap();
+        assert!(!engine.clock.is_running());
+        assert!(engine.tick_at(t0 + Duration::from_secs(1)).unwrap().is_none());
+        assert_eq!(engine.pending_enhancement_token(), Some(token));
+        let pts = first.pts.unwrap();
+        assert!(engine.enhancement_feedback(Some((token, pts, Duration::from_millis(40))), false, t0));
+        let second = next_fixture_video_at(&mut engine, t0);
+        assert!(second.pts.unwrap() > pts, "next input is prepared ahead of the held/display clock");
+        let next = engine.pending_enhancement_token().unwrap();
+        assert_ne!(next, token);
+        assert!(!engine.enhancement_feedback(Some((token, pts, Duration::from_millis(40))), false, t0));
+        assert_eq!(engine.pending_enhancement_token(), Some(next));
+    }
+
+    #[test]
+    fn enhancement_pause_and_seek_do_not_reuse_old_credit_or_resume_intent() {
+        let mut engine = playback_fixture_engine();
+        engine.set_async_video_clock(true);
+        let t0 = Instant::now();
+        engine.play_at(t0);
+        let first = next_fixture_video_at(&mut engine, t0);
+        let old = engine.pending_enhancement_token().unwrap();
+        engine.pause_at(t0);
+        assert!(engine.enhancement_feedback(Some((old, first.pts.unwrap(), Duration::from_millis(40))), false, t0));
+        assert_eq!(engine.state(), PlaybackRunState::Paused);
+        assert!(!engine.clock.is_running());
+        assert!(engine.tick_at(t0 + Duration::from_secs(1)).unwrap().is_none());
+        engine.seek_at(Duration::from_secs(2), t0).unwrap();
+        let preview = next_fixture_video_at(&mut engine, t0);
+        let token = engine.pending_enhancement_token().unwrap();
+        assert_ne!(token, old);
+        assert!(!engine.enhancement_feedback(Some((old, first.pts.unwrap(), Duration::from_millis(40))), false, t0));
+        assert_eq!(engine.pending_enhancement_token(), Some(token));
+        assert!(engine.enhancement_feedback(Some((token, preview.pts.unwrap(), Duration::from_millis(40))), false, t0));
+        assert_eq!(engine.state(), PlaybackRunState::Paused);
+        assert!(!engine.clock.is_running());
+        assert!(engine.tick_at(t0 + Duration::from_secs(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn enhancement_buffering_recovers_with_current_frame_before_future_activation() {
+        let mut engine = playback_fixture_engine();
+        engine.set_audio_output_active(false);
+        engine.set_async_video_clock(true);
+        let t0 = Instant::now();
+        engine.play_at(t0);
+        let first = next_fixture_video_at(&mut engine, t0);
+        let pts = first.pts.unwrap();
+        let token = engine.pending_enhancement_token().unwrap();
+        assert!(engine.enhancement_feedback(Some((token, pts, Duration::from_millis(40))), false, t0));
+        let next = next_fixture_video_at(&mut engine, t0);
+        let pending = engine.pending_enhancement_token();
+        let parked_at = t0 + Duration::from_millis(10);
+        engine.enhancement_feedback(None, true, parked_at);
+        assert!(engine.begin_buffering_at(parked_at));
+        let parked = engine.media_time_at(parked_at);
+        assert_eq!(engine.buffering_video_pts(), Some(parked));
+        assert!(next.pts.unwrap() > parked);
+        assert!(!engine.resume_buffering_at(parked, PlaybackClockSource::Wall, parked_at));
+        // A future completed frame releases the enhancement hold before its PTS.
+        assert!(engine.enhancement_feedback(None, false, parked_at));
+        assert!(engine.resume_buffering_at(parked, PlaybackClockSource::Wall, parked_at));
+        assert_eq!(engine.pending_enhancement_token(), pending);
+        assert_eq!(engine.media_time_at(parked_at), parked);
+        assert!(engine.media_time_at(parked_at + Duration::from_millis(40)) >= next.pts.unwrap());
+    }
+
+    #[test]
+    fn enhancement_eof_waits_for_final_activation_and_frame_interval() {
+        let mut engine = playback_fixture_engine();
+        engine.set_audio_output_active(false);
+        engine.set_async_video_clock(true);
+        let t0 = Instant::now();
+        engine.play_at(t0);
+        let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+        let mut completed = 0;
+        let mut last_end = Duration::ZERO;
+        while !engine.async_video_eof() {
+            if let Some(frame) = engine.tick_at(t0).unwrap() {
+                let token = engine.pending_enhancement_token().unwrap();
+                assert!(!engine.async_video_eof());
+                assert!(engine.tick_at(t0).unwrap().is_none());
+                let pts = frame.pts.unwrap();
+                last_end = pts + Duration::from_millis(40);
+                assert!(engine.enhancement_feedback(Some((token, pts, Duration::from_millis(40))), false, t0));
+                completed += 1;
+            }
+            assert!(Instant::now() < deadline, "fixture EOF timed out");
+            thread::yield_now();
+        }
+        assert!(completed > 100);
+        assert_ne!(engine.state(), PlaybackRunState::Ended);
+        assert!(engine.enhancement_final_end.is_some());
+        let _ = engine.tick_at(t0 + last_end + Duration::from_secs(1)).unwrap();
+        assert_eq!(engine.state(), PlaybackRunState::Ended);
+    }
+
+    #[test]
+    fn enhancement_hold_parks_clock_and_background_disable_invalidates_credit() {
+        let mut engine = playback_fixture_engine();
+        engine.set_async_video_clock(true);
+        let t0 = Instant::now();
+        engine.play_at(t0);
+        let frame = next_fixture_video_at(&mut engine, t0);
+        let token = engine.pending_enhancement_token().unwrap();
+        engine.enhancement_feedback(Some((token, frame.pts.unwrap(), Duration::from_millis(40))), false, t0);
+        let _next = next_fixture_video_at(&mut engine, t0);
+        let pending = engine.pending_enhancement_token().unwrap();
+        engine.enhancement_feedback(None, true, t0 + Duration::from_millis(20));
+        let parked = engine.media_time_at(t0 + Duration::from_secs(1));
+        assert_eq!(engine.media_time_at(t0 + Duration::from_secs(20)), parked);
+        engine.set_async_video_clock(false);
+        assert_eq!(engine.pending_enhancement_token(), None);
+        assert!(!engine.enhancement_feedback(Some((pending, frame.pts.unwrap(), Duration::from_millis(40))), false, t0));
+        assert!(engine.clock.is_running());
+        engine.set_async_video_clock(true);
+        assert!(!engine.clock.is_running());
     }
 
     #[test]

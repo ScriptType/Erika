@@ -950,13 +950,14 @@ impl MetalRendererImpl {
                     owner.drawable_submitted();
                     let presented_owner = owner.clone();
                     let clock = owner.presentation_clock();
+                    let clock_rate = owner.presentation_clock_rate();
                     let submitted = crate::shared_hdr::EngineOutput::host_time();
                     let callback = block2::RcBlock::new(
                         move |drawable: NonNull<ProtocolObject<dyn MTLDrawable>>| {
                             let host = drawable.as_ref().presentedTime();
                             let pts = presented_owner.info.pts_value as f64
                                 / presented_owner.info.pts_scale as f64;
-                            presented_owner.presented(host, pts - clock - (host - submitted), drawable.as_ref().drawableID() as u64);
+                            presented_owner.presented(host, pts - clock - (host - submitted) * clock_rate, drawable.as_ref().drawableID() as u64);
                         },
                     );
                     drawable.addPresentedHandler(&*callback as *const _ as *mut _);
