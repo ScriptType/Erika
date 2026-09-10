@@ -947,6 +947,7 @@ impl MetalRendererImpl {
             #[cfg(all(target_os = "macos", feature = "shared-hdr"))]
             if let Some(owner) = frame.frame.shared_owner.as_ref().cloned() {
                 if let Some(drawable) = &drawable {
+                    owner.drawable_submitted();
                     let presented_owner = owner.clone();
                     let clock = owner.presentation_clock();
                     let submitted = crate::shared_hdr::EngineOutput::host_time();
@@ -955,14 +956,14 @@ impl MetalRendererImpl {
                             let host = drawable.as_ref().presentedTime();
                             let pts = presented_owner.info.pts_value as f64
                                 / presented_owner.info.pts_scale as f64;
-                            presented_owner.presented(host, pts - clock - (host - submitted));
+                            presented_owner.presented(host, pts - clock - (host - submitted), drawable.as_ref().drawableID() as u64);
                         },
                     );
                     drawable.addPresentedHandler(&*callback as *const _ as *mut _);
                 }
                 let callback = block2::RcBlock::new(
-                    move |_: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
-                        let _keep_alive = &owner;
+                    move |buffer: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                        owner.gpu_complete(buffer.as_ref().status() == MTLCommandBufferStatus::Completed);
                     },
                 );
                 command_buffer.addCompletedHandler(&*callback as *const _ as *mut _);

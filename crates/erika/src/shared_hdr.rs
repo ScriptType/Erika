@@ -4,9 +4,13 @@
 use crate::core::*;
 use crate::renderer::metal::{MetalRenderer, MetalRendererConfig};
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+#[path = "shared_hdr_diagnostics.rs"]
+mod presentation_diagnostics;
+use presentation_diagnostics::PresentationDiagnostics;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -99,6 +103,7 @@ struct SessionHandle {
     generation: AtomicU64,
     seek_started: AtomicU64,
     unpresented_drawables: AtomicU64,
+    diagnostics: Option<Mutex<PresentationDiagnostics>>,
 }
 unsafe impl Send for SessionHandle {}
 unsafe impl Sync for SessionHandle {}
@@ -118,8 +123,23 @@ impl EngineOutput {
     pub fn presentation_clock(&self) -> f64 {
         f64::from_bits(self.clock.load(Ordering::Relaxed))
     }
-    pub fn presented(&self, host: f64, av_offset: f64) {
-        if self.info.generation != self.session.generation.load(Ordering::Relaxed) {
+    pub fn drawable_submitted(&self) {
+        if let Some(diagnostics) = &self.session.diagnostics {
+            diagnostics.lock().unwrap().submitted(Self::host_time());
+        }
+    }
+    pub fn gpu_complete(&self, success: bool) {
+        if let Some(diagnostics) = &self.session.diagnostics {
+            diagnostics.lock().unwrap().gpu_complete(Self::host_time(), success);
+        }
+    }
+    pub fn presented(&self, host: f64, av_offset: f64, drawable_id: u64) {
+        let stale = self.info.generation != self.session.generation.load(Ordering::Relaxed);
+        if let Some(diagnostics) = &self.session.diagnostics {
+            diagnostics.lock().unwrap().presented(Self::host_time(), host, drawable_id,
+                self.info.generation, self.info.frame_id, stale);
+        }
+        if stale {
             return;
         }
         // Apple reports zero for drawables that were never displayed or dropped.
@@ -255,6 +275,8 @@ impl SharedHDRRenderer {
                 generation: AtomicU64::new(engine_generation),
                 seek_started: AtomicU64::new(0),
                 unpresented_drawables: AtomicU64::new(0),
+                diagnostics: (std::env::var("ERIKA_ADAPTER_DIAGNOSTICS").as_deref() == Ok("1"))
+                    .then(|| Mutex::new(PresentationDiagnostics::default())),
             }),
             playback_generation: None,
             engine_generation,
@@ -366,6 +388,7 @@ impl Drop for SharedHDRRenderer {
                 let diagnostics = serde_json::json!({"decodedFrames":self.decoded_frames,"admissionDrops":self.admission_drops,"staleCompletions":self.stale_outputs,
                 "displayWidth":self.display_size.0,"displayHeight":self.display_size.1,
                 "unpresentedDrawableCallbacks":self.session.unpresented_drawables.load(Ordering::Relaxed),
+                "presentationDiagnostics":self.session.diagnostics.as_ref().map(|v| serde_json::to_value(&*v.lock().unwrap()).unwrap()),
                 "displayHeadroomRange":self.headroom_range,"renderer":format!("{:?}",self.inner.runtime_stats()),
                 "clockMeasurement":"audio callback media time sampled before encode, advanced to CAMetalDrawable presentedTime at 1x; unavailable without audio",
                 "limitations":["Live overload drops admission; synchronized buffering policy remains required","Late enhanced overlays omitted until timestamp pairing matches","No physical display accuracy or M5 performance claim"]});

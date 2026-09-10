@@ -33,6 +33,9 @@ static NSString *ErikaFormatTime(double seconds) {
 @property(nonatomic, strong) CAMetalLayer *metalLayer;
 @property(nonatomic, strong) NSTimer *timer;
 @property(nonatomic, assign) CFTimeInterval startTime;
+@property(nonatomic, assign) CFTimeInterval lastWindowLog;
+@property(nonatomic, strong) NSDictionary *lastWindowState;
+@property(nonatomic, assign) BOOL diagnosticsEnabled;
 @end
 
 @implementation ErikaMetalDemoView
@@ -47,6 +50,8 @@ static NSString *ErikaFormatTime(double seconds) {
     self.metalLayer.opaque = YES;
     self.layer = self.metalLayer;
     self.startTime = CACurrentMediaTime();
+    self.diagnosticsEnabled = getenv("ERIKA_ADAPTER_DIAGNOSTICS") &&
+      strcmp(getenv("ERIKA_ADAPTER_DIAGNOSTICS"), "1") == 0;
   }
   return self;
 }
@@ -58,6 +63,20 @@ static NSString *ErikaFormatTime(double seconds) {
 - (void)viewDidMoveToWindow {
   [super viewDidMoveToWindow];
   [self updateDrawableSizeAndAttach:YES];
+  if (self.diagnosticsEnabled && self.window != nil) {
+    NSNotificationCenter *center = NSNotificationCenter.defaultCenter;
+    for (NSNotificationName name in @[NSWindowDidChangeOcclusionStateNotification,
+        NSWindowDidMiniaturizeNotification, NSWindowDidDeminiaturizeNotification,
+        NSWindowDidBecomeKeyNotification, NSWindowDidResignKeyNotification]) {
+      [center addObserver:self selector:@selector(diagnosticWindowChanged:) name:name object:self.window];
+    }
+    for (NSNotificationName name in @[NSApplicationDidBecomeActiveNotification,
+        NSApplicationDidResignActiveNotification, NSApplicationDidHideNotification,
+        NSApplicationDidUnhideNotification]) {
+      [center addObserver:self selector:@selector(diagnosticWindowChanged:) name:name object:NSApp];
+    }
+    [self recordWindowState];
+  }
   if (self.window != nil && self.timer == nil) {
     self.timer = [NSTimer scheduledTimerWithTimeInterval:(1.0 / 60.0)
                                                   target:self
@@ -69,6 +88,9 @@ static NSString *ErikaFormatTime(double seconds) {
 }
 
 - (void)viewWillMoveToWindow:(NSWindow *)newWindow {
+  if (self.diagnosticsEnabled) {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+  }
   if (newWindow == nil) {
     [self.timer invalidate];
     self.timer = nil;
@@ -103,8 +125,47 @@ static NSString *ErikaFormatTime(double seconds) {
 - (void)renderTick:(NSTimer *)timer {
   (void)timer;
   double elapsed = CACurrentMediaTime() - self.startTime;
+  if (self.diagnosticsEnabled) {
+    [self recordWindowState];
+  }
   erika_demo_update_headroom(self.window.screen.maximumExtendedDynamicRangeColorComponentValue);
   erika_demo_render_frame(elapsed);
+}
+
+- (void)recordWindowState {
+  NSWindow *window = self.window;
+  NSDictionary *state = @{
+    @"active": @(NSApp.isActive), @"key": @(window.isKeyWindow),
+    @"visible": @(window.isVisible), @"onActiveSpace": @(window.isOnActiveSpace),
+    @"occlusionVisible": @((window.occlusionState & NSWindowOcclusionStateVisible) != 0),
+    @"miniaturized": @(window.isMiniaturized), @"windowNumber": @(window.windowNumber),
+    @"frontmostPID": @(NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier),
+    @"pid": @(NSProcessInfo.processInfo.processIdentifier),
+    @"layerMatchesView": @(self.layer == self.metalLayer),
+    @"layerHasSuperlayer": @(self.metalLayer.superlayer != nil),
+    @"layerHidden": @(self.metalLayer.hidden), @"layerOpacity": @(self.metalLayer.opacity),
+    @"presentsWithTransaction": @(self.metalLayer.presentsWithTransaction),
+    @"displaySyncEnabled": @(self.metalLayer.displaySyncEnabled),
+    @"drawableWidth": @(self.metalLayer.drawableSize.width),
+    @"drawableHeight": @(self.metalLayer.drawableSize.height),
+    @"contentsScale": @(self.metalLayer.contentsScale),
+    @"bounds": NSStringFromRect(self.bounds), @"visibleRect": NSStringFromRect(self.visibleRect)
+  };
+  CFTimeInterval now = CACurrentMediaTime();
+  if (![state isEqualToDictionary:self.lastWindowState] || now - self.lastWindowLog >= 1.0) {
+    NSDictionary *event = @{@"event": @"erika_native_window", @"host": @(now),
+      @"elapsed": @(now - self.startTime), @"state": state,
+      @"edrHeadroom": @(window.screen.maximumExtendedDynamicRangeColorComponentValue)};
+    NSData *json = [NSJSONSerialization dataWithJSONObject:event options:0 error:nil];
+    fprintf(stderr, "%s\n", [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding].UTF8String);
+    self.lastWindowState = state;
+    self.lastWindowLog = now;
+  }
+}
+
+- (void)diagnosticWindowChanged:(NSNotification *)notification {
+  (void)notification;
+  [self recordWindowState];
 }
 
 @end
@@ -267,6 +328,9 @@ static NSString *ErikaFormatTime(double seconds) {
 @interface ErikaMetalDemoDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, strong) NSWindow *window;
 @property(nonatomic, strong) NSTimer *smokeTimer;
+@property(nonatomic, strong) NSTimer *diagnosticCoverTimer;
+@property(nonatomic, strong) NSTimer *diagnosticRevealTimer;
+@property(nonatomic, strong) NSWindow *diagnosticCoverWindow;
 @end
 
 @implementation ErikaMetalDemoDelegate
@@ -302,6 +366,31 @@ static NSString *ErikaFormatTime(double seconds) {
   [self.window makeKeyAndOrderFront:nil];
   if (getenv("ERIKA_ADAPTER_FOREGROUND") && strcmp(getenv("ERIKA_ADAPTER_FOREGROUND"), "1") == 0) {
     [NSApp activateIgnoringOtherApps:YES];
+  }
+  // Diagnostic-only occlusion leaves the playback window and all renderer
+  // timers alive. Ordering out the application's final window may terminate it.
+  if (getenv("ERIKA_ADAPTER_DIAGNOSTICS") && strcmp(getenv("ERIKA_ADAPTER_DIAGNOSTICS"), "1") == 0 &&
+      getenv("ERIKA_ADAPTER_OCCLUDE_AT") && getenv("ERIKA_ADAPTER_REVEAL_AT")) {
+    self.diagnosticCoverTimer = [NSTimer scheduledTimerWithTimeInterval:strtod(getenv("ERIKA_ADAPTER_OCCLUDE_AT"), NULL)
+      repeats:NO block:^(NSTimer *timer) {
+        (void)timer;
+        self.diagnosticCoverWindow = [[NSWindow alloc] initWithContentRect:self.window.frame
+          styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+        self.diagnosticCoverWindow.backgroundColor = NSColor.blackColor;
+        self.diagnosticCoverWindow.opaque = YES;
+        self.diagnosticCoverWindow.hasShadow = NO;
+        self.diagnosticCoverWindow.ignoresMouseEvents = YES;
+        self.diagnosticCoverWindow.level = self.window.level + 1;
+        [self.diagnosticCoverWindow orderFrontRegardless];
+      }];
+    self.diagnosticRevealTimer = [NSTimer scheduledTimerWithTimeInterval:strtod(getenv("ERIKA_ADAPTER_REVEAL_AT"), NULL)
+      repeats:NO block:^(NSTimer *timer) {
+        (void)timer;
+        [self.diagnosticCoverWindow orderOut:nil];
+        self.diagnosticCoverWindow = nil;
+      }];
+    [[NSRunLoop mainRunLoop] addTimer:self.diagnosticCoverTimer forMode:NSRunLoopCommonModes];
+    [[NSRunLoop mainRunLoop] addTimer:self.diagnosticRevealTimer forMode:NSRunLoopCommonModes];
   }
   double smokeSeconds = erika_demo_smoke_seconds();
   if (smokeSeconds > 0.0) {
