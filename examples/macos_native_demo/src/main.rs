@@ -57,6 +57,10 @@ impl DemoState {
         }
         if !self.load_attempted {
             self.load_attempted = true;
+            if env::var("ERIKA_ADAPTER_MUTE").as_deref() == Ok("1") {
+                self.presenter.set_volume(0.0);
+                eprintln!("Erika adapter: application audio muted; device clock remains active");
+            }
             if let Some(uri) = MEDIA_URI.get() {
                 match self.presenter.open(MediaRequest::new(uri)) {
                     Ok(()) => {

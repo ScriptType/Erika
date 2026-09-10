@@ -274,6 +274,21 @@ static NSString *ErikaFormatTime(double seconds) {
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
   (void)notification;
   NSRect frame = NSMakeRect(0, 0, 960, 540);
+  const char *widthText = getenv("ERIKA_ADAPTER_DISPLAY_WIDTH");
+  const char *heightText = getenv("ERIKA_ADAPTER_DISPLAY_HEIGHT");
+  if (widthText || heightText) {
+    char *widthEnd = NULL, *heightEnd = NULL;
+    long width = widthText ? strtol(widthText, &widthEnd, 10) : 0;
+    long height = heightText ? strtol(heightText, &heightEnd, 10) : 0;
+    if (!widthEnd || *widthEnd || !heightEnd || *heightEnd ||
+        width < 640 || width > 8192 || height < 360 || height > 8192) {
+      NSLog(@"Invalid requested physical drawable size");
+      exit(64);
+    }
+    CGFloat scale = NSScreen.mainScreen.backingScaleFactor;
+    if (scale <= 0) scale = 1;
+    frame.size = NSMakeSize((CGFloat)width / scale, (CGFloat)height / scale + 44);
+  }
   self.window = [[NSWindow alloc] initWithContentRect:frame
                                             styleMask:(NSWindowStyleMaskTitled |
                                                        NSWindowStyleMaskClosable |
