@@ -767,6 +767,23 @@ pub trait RendererBackend {
     /// Ordinary and bypass renderers retain their synchronous upload contract.
     fn uses_async_video_clock(&self) -> bool { false }
 
+    /// Retain one refused upload for a later render tick. This admission policy
+    /// does not select the media/audio clock or enable enhancement holds.
+    fn retries_video_upload_backpressure(&self) -> bool { self.uses_async_video_clock() }
+
+    /// The presenter discarded its refused input at a lifecycle boundary.
+    /// Clear admission bookkeeping without discarding the displayed frame.
+    fn cancel_video_upload_retry(&mut self) {}
+
+    /// The player must wait for resolved renderer output and drained PCM at EOF.
+    fn requires_output_drain(&self) -> bool { false }
+
+    /// Called after the worker has handed off its final frame. Implementations
+    /// must include their latest accepted upload and a resolved drawable
+    /// callback or observed unavailable drawable acquisition. Neither a zero
+    /// presentedTime nor unavailable acquisition certifies visible output.
+    fn video_output_drained(&self) -> bool { true }
+
     fn poll_async_video_output(&mut self) -> Result<Option<AsyncVideoOutput>> { Ok(None) }
 
     fn activate_async_video_output(&mut self, _output: AsyncVideoOutput) -> Result<()> { Ok(()) }
@@ -1004,6 +1021,10 @@ struct PlayerInner {
     async_video_clock: bool,
     async_video_eof: bool,
     enhancement_audio_unavailable: bool,
+    output_drain_required: bool,
+    output_drain_epoch: u64,
+    output_drain_request: Option<OutputDrainRequest>,
+    output_drain_feedback: Option<OutputDrainFeedback>,
 }
 
 struct PlayerLifecycle {
@@ -1073,7 +1094,50 @@ impl AudioClockObservation {
     }
 }
 
+/// Issued only after decoded output is exhausted. Earlier idle observations
+/// cannot acknowledge a later final-frame handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OutputDrainRequest {
+    nonce: u64,
+    context: AudioClockContext,
+    drain_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OutputDrainFeedback {
+    player_id: PlayerId,
+    request: OutputDrainRequest,
+    audio: Option<AudioClockObservation>,
+    captured_at: Instant,
+}
+
+impl OutputDrainFeedback {
+    fn is_current(&self, inner: &PlayerInner, generation: u64,
+        command_sequence: u64, now: Instant) -> bool {
+        inner.output_drain_required
+            && inner.output_drain_request == Some(self.request)
+            && self.request.drain_epoch == inner.output_drain_epoch
+            && self.request.context == AudioClockContext::from_inner(inner)
+            && inner.state == PlayerState::Playing
+            && self.request.context.generation == generation
+            && self.request.context.command_sequence == command_sequence
+            && now.checked_duration_since(self.captured_at)
+                .is_some_and(|age| age < AUDIO_CLOCK_SNAPSHOT_STALE_AFTER)
+            && self.audio.map_or_else(|| {
+                inner.track_selection.audio.is_none() || inner.audio_frame_sender.is_none()
+            }, |audio| {
+                audio.context == self.request.context && audio.snapshot.queued_frames == 0
+                    && audio.is_current(inner, generation, command_sequence, now)
+            })
+            && inner.video_frame_sender.as_ref().is_none_or(Sender::is_empty)
+            && inner.audio_frame_sender.as_ref().is_none_or(Sender::is_empty)
+    }
+}
+
 enum PlaybackCommand {
+    OutputDrainMode { required: bool, epoch: u64 },
+    InvalidateOutputDrain { epoch: u64 },
+    OutputDrained(OutputDrainFeedback),
     AsyncVideoClock(bool),
     AsyncVideoFeedback {
         generation: u64,
@@ -1216,6 +1280,10 @@ impl Player {
                 async_video_clock: false,
                 async_video_eof: false,
                 enhancement_audio_unavailable: false,
+                output_drain_required: false,
+                output_drain_epoch: 1,
+                output_drain_request: None,
+                output_drain_feedback: None,
             })),
             lifecycle: Arc::new(Mutex::new(PlayerLifecycle {
                 epoch: 1,
@@ -1518,6 +1586,60 @@ impl Player {
         Ok(())
     }
 
+    pub(crate) fn set_output_drain_required(&self, required: bool) -> Result<()> {
+        let epoch = {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.output_drain_required = required;
+            inner.output_drain_epoch = inner.output_drain_epoch.wrapping_add(1).max(1);
+            inner.output_drain_request = None;
+            inner.output_drain_epoch
+        };
+        if let Some(commands) = self.optional_playback_commands() {
+            commands.send(PlaybackCommand::OutputDrainMode { required, epoch })
+                .map_err(|_| PlayerError::Playback("playback worker is not running".into()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn invalidate_output_drain(&self) -> Result<()> {
+        let epoch = {
+            let mut inner = self.inner.lock().expect("player mutex poisoned");
+            inner.output_drain_epoch = inner.output_drain_epoch.wrapping_add(1).max(1);
+            inner.output_drain_request = None;
+            inner.output_drain_epoch
+        };
+        if let Some(commands) = self.optional_playback_commands() {
+            commands.send(PlaybackCommand::InvalidateOutputDrain { epoch })
+                .map_err(|_| PlayerError::Playback("playback worker is not running".into()))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn output_drain_request(&self) -> Option<OutputDrainRequest> {
+        let inner = self.inner.lock().expect("player mutex poisoned");
+        inner.output_drain_request.filter(|request| {
+            inner.state == PlayerState::Playing
+                && request.context == AudioClockContext::from_inner(&inner)
+                && request.drain_epoch == inner.output_drain_epoch
+        })
+    }
+
+    pub(crate) fn capture_output_drain_feedback(&self, request: OutputDrainRequest,
+        read: impl FnOnce() -> Option<AudioClockSnapshot>) -> Option<OutputDrainFeedback> {
+        if self.output_drain_request() != Some(request) { return None; }
+        let captured_at = Instant::now();
+        let audio = self.capture_audio_clock(read);
+        let feedback = OutputDrainFeedback { player_id: self.id, request, audio, captured_at };
+        let inner = self.inner.lock().expect("player mutex poisoned");
+        feedback.is_current(&inner, inner.playback_generation,
+            inner.playback_command_sequence, Instant::now()).then_some(feedback)
+    }
+
+    pub(crate) fn acknowledge_output_drain(&self, feedback: OutputDrainFeedback) -> Result<()> {
+        if feedback.player_id != self.id { return Ok(()); }
+        self.send_playback_command(PlaybackCommand::OutputDrained(feedback))
+    }
+
     pub(crate) fn set_async_video_clock(&self, enabled: bool) -> Result<()> {
         {
             let mut inner = self.inner.lock().expect("player mutex poisoned");
@@ -1787,6 +1909,8 @@ impl Player {
     pub(crate) fn invalidate_audio_clock(&self) {
         let mut inner = self.inner.lock().expect("player mutex poisoned");
         inner.audio_output_epoch = inner.audio_output_epoch.saturating_add(1);
+        inner.output_drain_epoch = inner.output_drain_epoch.wrapping_add(1).max(1);
+        inner.output_drain_request = None;
     }
 
     pub fn update_audio_clock_observation(&self, observation: AudioClockObservation) -> Result<()> {
@@ -2102,6 +2226,10 @@ fn run_playback_worker(
     initial_generation: u64,
 ) {
     engine.set_async_video_clock(inner.lock().expect("player mutex poisoned").async_video_clock);
+    {
+        let shared = inner.lock().expect("player mutex poisoned");
+        engine.set_output_drain_required(shared.output_drain_required, shared.output_drain_epoch);
+    }
     let mut pending_async_handoff: Option<PlayerVideoFrame> = None;
     let worker_started = std::time::Instant::now();
     let mut last_position_event = None;
@@ -2167,14 +2295,25 @@ fn run_playback_worker(
                 return;
             }
         }
+        // Output invalidation is published before its command is queued. Do
+        // not let a previously accepted drain survive that small send race.
+        {
+            let shared = inner.lock().expect("player mutex poisoned");
+            if engine.output_drain_epoch() != shared.output_drain_epoch {
+                engine.set_output_drain_required(shared.output_drain_required, shared.output_drain_epoch);
+            }
+        }
         if engine.state() != PlaybackRunState::Ended {
             eof_published = false;
         }
         let after_commands = std::time::Instant::now();
         let handoff_current = pending_async_handoff.as_ref().is_some_and(|frame| {
-            frame.generation == playback_generation && engine.uses_async_video_clock()
-                && frame.enhancement_token.is_some()
-                && frame.enhancement_token == engine.pending_enhancement_token()
+            frame.generation == playback_generation
+                && !engine.video_decode_is_suspended()
+                && (if engine.uses_async_video_clock() {
+                    frame.enhancement_token.is_some()
+                        && frame.enhancement_token == engine.pending_enhancement_token()
+                } else { engine.requires_output_drain() })
         });
         retry_enhancement_handoff(&mut pending_async_handoff, frame_output_quiesced,
             handoff_current, |frame| emit_async_video_frame_from_worker(&inner, frame));
@@ -2200,15 +2339,21 @@ fn run_playback_worker(
             &inner,
             playback_generation,
             "before_video_tick",
+            last_executed_playback_command_sequence,
+            pending_async_handoff.is_none() && !frame_output_quiesced,
             &mut last_worker_clock,
         );
         let after_clock_sync = std::time::Instant::now();
 
         let mut produced_video_frame = false;
-        if !frame_output_quiesced {
+        if !frame_output_quiesced && pending_async_handoff.is_none() {
             match engine.tick() {
                 Ok(Some(frame)) => {
                     produced_video_frame = true;
+                    let output_end = frame.pts.zip(frame.frame.duration())
+                        .and_then(|(pts, duration)| Duration::try_from_secs_f64(duration.seconds()).ok()
+                            .filter(|duration| !duration.is_zero())
+                            .map(|duration| pts.saturating_add(duration)));
                     let position = frame.pts.unwrap_or(frame.media_time);
                     last_position_event = Some((playback_generation, position));
                     trace::log(format!(
@@ -2233,8 +2378,11 @@ fn run_playback_worker(
                         playback_generation,
                     ) {
                         Ok(mut frame) => {
-                            if engine.uses_async_video_clock() {
-                                frame.enhancement_token = engine.pending_enhancement_token();
+                            engine.record_video_output_end(output_end);
+                            if engine.uses_async_video_clock() || engine.requires_output_drain() {
+                                if engine.uses_async_video_clock() {
+                                    frame.enhancement_token = engine.pending_enhancement_token();
+                                }
                                 pending_async_handoff = emit_async_video_frame_from_worker(&inner, frame);
                             } else {
                                 emit_video_frame_from_worker(&inner, frame);
@@ -2264,6 +2412,8 @@ fn run_playback_worker(
             &inner,
             playback_generation,
             "after_video_tick",
+            last_executed_playback_command_sequence,
+            pending_async_handoff.is_none() && !frame_output_quiesced,
             &mut last_worker_clock,
         );
         let after_video = std::time::Instant::now();
@@ -2312,6 +2462,8 @@ fn run_playback_worker(
             &inner,
             playback_generation,
             "after_av_tick",
+            last_executed_playback_command_sequence,
+            pending_async_handoff.is_none() && !frame_output_quiesced,
             &mut last_worker_clock,
         );
         let after_av = std::time::Instant::now();
@@ -2726,6 +2878,26 @@ fn handle_playback_command(
     frame_output_quiesced: &mut bool,
 ) -> bool {
     match command {
+        PlaybackCommand::OutputDrainMode { required, epoch } => {
+            let shared = inner.lock().expect("player mutex poisoned");
+            if epoch == shared.output_drain_epoch {
+                engine.set_output_drain_required(required, epoch);
+            }
+        }
+        PlaybackCommand::InvalidateOutputDrain { epoch } => {
+            if epoch == inner.lock().expect("player mutex poisoned").output_drain_epoch {
+                engine.invalidate_output_drain(epoch);
+            }
+        }
+        PlaybackCommand::OutputDrained(feedback) => {
+            let mut shared = inner.lock().expect("player mutex poisoned");
+            if feedback.is_current(&shared, *playback_generation,
+                *last_executed_playback_command_sequence, Instant::now())
+                && engine.output_drain_epoch() == feedback.request.drain_epoch
+                && engine.acknowledge_output_drain(feedback.request.nonce) {
+                shared.output_drain_feedback = Some(feedback);
+            }
+        }
         PlaybackCommand::AsyncVideoClock(enabled) => engine.set_async_video_clock(enabled),
         PlaybackCommand::AsyncVideoFeedback { generation, activated, held, audio } => {
             if generation == *playback_generation && generation == shared_playback_generation(inner) {
@@ -3248,11 +3420,34 @@ fn sync_track_state_from_worker(inner: &Arc<Mutex<PlayerInner>>, engine: &VideoP
 }
 
 fn publish_natural_eof_from_worker(
-    engine: &VideoPlaybackEngine,
+    engine: &mut VideoPlaybackEngine,
     inner: &Arc<Mutex<PlayerInner>>,
     playback_generation: u64,
     eof_published: &mut bool,
 ) -> bool {
+    if let Some(nonce) = engine.output_drain_ready_to_commit() {
+        let mut shared = inner.lock().expect("player mutex poisoned");
+        let valid = shared.output_drain_feedback.is_some_and(|feedback| {
+            feedback.request.nonce == nonce
+                && engine.output_drain_epoch() == shared.output_drain_epoch
+                && feedback.is_current(&shared, playback_generation,
+                    shared.playback_command_sequence, Instant::now())
+        });
+        if !valid {
+            engine.invalidate_output_drain(shared.output_drain_epoch);
+            shared.output_drain_request = None;
+            shared.output_drain_feedback = None;
+            return false;
+        }
+        if engine.commit_output_drain(nonce) {
+            let final_position = engine.info().duration.unwrap_or_else(|| engine.media_time());
+            publish_natural_eof_events_locked(&mut shared, playback_generation,
+                final_position, eof_published);
+            shared.output_drain_request = None;
+            shared.output_drain_feedback = None;
+            return true;
+        }
+    }
     if engine.state() != PlaybackRunState::Ended {
         *eof_published = false;
         return false;
@@ -3280,6 +3475,16 @@ fn publish_natural_eof_events_from_worker(
         return;
     }
     let mut inner = inner.lock().expect("player mutex poisoned");
+    publish_natural_eof_events_locked(&mut inner, playback_generation, final_position, eof_published);
+}
+
+fn publish_natural_eof_events_locked(
+    inner: &mut PlayerInner,
+    playback_generation: u64,
+    final_position: Duration,
+    eof_published: &mut bool,
+) {
+    if *eof_published { return; }
     let generation = playback_generation.max(1);
     if worker_generation_is_stale(generation, inner.playback_generation) {
         trace::log(format!(
@@ -3314,6 +3519,8 @@ fn sync_playback_clock_from_worker(
     inner: &Arc<Mutex<PlayerInner>>,
     playback_generation: u64,
     stage: &'static str,
+    command_sequence: u64,
+    frame_outputs_handed_off: bool,
     last_worker_clock: &mut Option<(Duration, u64)>,
 ) {
     let clock = engine.clock();
@@ -3360,6 +3567,15 @@ fn sync_playback_clock_from_worker(
     inner.playback_generation = generation;
     inner.async_video_eof = engine.async_video_eof();
     inner.enhancement_audio_unavailable = engine.enhancement_audio_unavailable();
+    inner.output_drain_request = engine.pending_output_drain().filter(|_| {
+        frame_outputs_handed_off
+            && command_sequence == inner.playback_command_sequence
+            && engine.output_drain_epoch() == inner.output_drain_epoch
+    }).map(|nonce| OutputDrainRequest {
+        nonce,
+        context: AudioClockContext::from_inner(&inner),
+        drain_epoch: inner.output_drain_epoch,
+    });
     *last_worker_clock = Some((media_time, generation));
 }
 
@@ -5253,6 +5469,234 @@ mod tests {
             written_frames: 14_400,
             underflow_frames: 0,
         }
+    }
+
+    fn eof_drain_test_request(player: &Player) -> OutputDrainRequest {
+        let mut inner = player.inner.lock().unwrap();
+        inner.state = PlayerState::Playing;
+        inner.output_drain_required = true;
+        let request = OutputDrainRequest {
+            nonce: 7,
+            context: AudioClockContext::from_inner(&inner),
+            drain_epoch: inner.output_drain_epoch,
+        };
+        inner.output_drain_request = Some(request);
+        request
+    }
+
+    fn eof_drain_empty_audio() -> AudioClockSnapshot {
+        AudioClockSnapshot {
+            media_time: Some(Duration::from_millis(300)),
+            queued_duration: Some(Duration::ZERO),
+            queued_frames: 0,
+            read_frames: 14_400,
+            written_frames: 14_400,
+            underflow_frames: 0,
+        }
+    }
+
+    #[test]
+    fn eof_drain_feedback_requires_actual_empty_pcm_and_current_identity() {
+        for change in 0..6 {
+            let player = Player::new(PlayerConfig::default());
+            let request = eof_drain_test_request(&player);
+            assert!(player.capture_output_drain_feedback(request,
+                || Some(audio_observation_test_sample())).is_none());
+            let mut feedback = player.capture_output_drain_feedback(request,
+                || Some(eof_drain_empty_audio())).unwrap();
+            let mut inner = player.inner.lock().unwrap();
+            assert!(feedback.is_current(&inner, inner.playback_generation,
+                inner.playback_command_sequence, Instant::now()));
+            match change {
+                0 => inner.playback_generation += 1,
+                1 => inner.playback_command_sequence += 1,
+                2 => inner.audio_output_epoch += 1,
+                3 => inner.output_drain_epoch += 1,
+                4 => inner.output_drain_request.as_mut().unwrap().nonce += 1,
+                5 => feedback.captured_at -= AUDIO_CLOCK_SNAPSHOT_STALE_AFTER,
+                _ => unreachable!(),
+            }
+            assert!(!feedback.is_current(&inner, inner.playback_generation,
+                inner.playback_command_sequence, Instant::now()));
+        }
+    }
+
+    #[test]
+    fn eof_drain_capture_cannot_cross_output_reset_or_a_new_request() {
+        let player = Player::new(PlayerConfig::default());
+        let request = eof_drain_test_request(&player);
+        assert!(player.capture_output_drain_feedback(request, || {
+            player.invalidate_audio_clock();
+            Some(eof_drain_empty_audio())
+        }).is_none());
+        let request = eof_drain_test_request(&player);
+        assert!(player.capture_output_drain_feedback(request, || {
+            player.inner.lock().unwrap().output_drain_request.as_mut().unwrap().nonce += 1;
+            Some(eof_drain_empty_audio())
+        }).is_none());
+    }
+
+    #[test]
+    fn eof_drain_no_audio_path_requires_no_selected_audio_or_consumer() {
+        let player = Player::new(PlayerConfig::default());
+        let request = eof_drain_test_request(&player);
+        assert!(player.capture_output_drain_feedback(request, || None).is_some());
+        let (sender, _receiver) = bounded(1);
+        {
+            let mut inner = player.inner.lock().unwrap();
+            inner.track_selection.audio = Some(1);
+            inner.audio_frame_sender = Some(sender);
+        }
+        assert!(player.capture_output_drain_feedback(request, || None).is_none());
+        assert!(player.capture_output_drain_feedback(request,
+            || Some(eof_drain_empty_audio())).is_some());
+        player.inner.lock().unwrap().audio_frame_sender = None;
+        assert!(player.capture_output_drain_feedback(request, || None).is_some());
+    }
+
+    #[test]
+    fn eof_drain_full_audio_handoff_blocks_even_an_empty_device_snapshot() {
+        let player = Player::new(PlayerConfig::default());
+        let request = eof_drain_test_request(&player);
+        let (sender, receiver) = bounded(1);
+        let frame = PcmAudioFrame {
+            format: crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2),
+            pts: None,
+            frames: 1,
+            samples: vec![0.0, 0.0],
+        };
+        sender.send(PlayerAudioFrame { frame, generation: request.context.generation }).unwrap();
+        player.inner.lock().unwrap().audio_frame_sender = Some(sender);
+        assert!(player.capture_output_drain_feedback(request,
+            || Some(eof_drain_empty_audio())).is_none());
+        drop(receiver.recv().unwrap());
+        assert!(player.capture_output_drain_feedback(request,
+            || Some(eof_drain_empty_audio())).is_some());
+    }
+
+    fn eof_drain_fixture_engine_and_frame() -> (VideoPlaybackEngine, PlayerVideoFrame) {
+        let path = std::env::var_os("ERIKA_PLAYBACK_FIXTURE").map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/playback/playback-fixture.mkv"));
+        assert!(path.is_file(), "missing software playback fixture: {}", path.display());
+        let mut engine = VideoPlaybackEngine::open(&MediaRequest::new(path.to_string_lossy()),
+            PlaybackSessionConfig { video_decode: crate::playback::VideoDecodePreference::Software,
+                ..PlaybackSessionConfig::default() }).unwrap();
+        engine.set_audio_output_active(false);
+        engine.play().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let frame = loop {
+            if let Some(frame) = engine.tick().unwrap() { break frame; }
+            assert!(Instant::now() < deadline, "fixture first frame timed out");
+            thread::yield_now();
+        };
+        let frame = PlayerVideoFrame::from_decoded(frame.frame, frame.decode_backend,
+            frame.pts, frame.media_time, frame.late_by, 1).unwrap();
+        engine.set_output_drain_required(true, 1);
+        engine.seek(Duration::from_secs(9)).unwrap();
+        while engine.pending_output_drain().is_none() {
+            let _ = engine.tick().unwrap();
+            assert!(Instant::now() < deadline, "fixture drain request timed out");
+            thread::yield_now();
+        }
+        (engine, frame)
+    }
+
+    #[test]
+    fn eof_drain_full_video_handoff_retains_final_owner_and_withholds_request() {
+        let (engine, frame) = eof_drain_fixture_engine_and_frame();
+        assert!(!engine.uses_async_video_clock());
+        assert!(frame.enhancement_token.is_none());
+        let final_frame = PlayerVideoFrame {
+            frame: frame.frame.try_clone_ref().unwrap(),
+            decode_backend: frame.decode_backend,
+            pts: Some(Duration::from_millis(7_960)),
+            media_time: Duration::from_millis(7_960),
+            late_by: None,
+            generation: 1,
+            enhancement_token: None,
+        };
+        let player = Player::new(PlayerConfig::default());
+        let _ = eof_drain_test_request(&player);
+        let (sender, receiver) = bounded(1);
+        player.inner.lock().unwrap().video_frame_sender = Some(sender.clone());
+        assert!(try_send_retained(&sender, frame).is_none());
+        let mut pending = try_send_retained(&sender, final_frame);
+        assert!(pending.is_some());
+        let mut last_clock = None;
+        sync_playback_clock_from_worker(&engine, &player.inner, 1, "test_pending", 0,
+            pending.is_none(), &mut last_clock);
+        assert!(player.output_drain_request().is_none(), "worker still owns the final handoff");
+        drop(receiver.recv().unwrap());
+        retry_enhancement_handoff(&mut pending, false, true,
+            |frame| try_send_retained(&sender, frame));
+        assert!(pending.is_none());
+        sync_playback_clock_from_worker(&engine, &player.inner, 1, "test_handed_off", 0,
+            true, &mut last_clock);
+        let request = player.output_drain_request().unwrap();
+        assert!(player.capture_output_drain_feedback(request, || None).is_none(),
+            "presenter still has the final frame queued");
+        assert_eq!(receiver.recv().unwrap().pts, Some(Duration::from_millis(7_960)));
+        assert!(player.capture_output_drain_feedback(request, || None).is_some());
+    }
+
+    #[test]
+    fn eof_drain_final_publication_revalidates_after_acknowledgement() {
+        let (mut engine, _frame) = eof_drain_fixture_engine_and_frame();
+        let player = Player::new(PlayerConfig::default());
+        let _ = eof_drain_test_request(&player);
+        let mut last_clock = None;
+        sync_playback_clock_from_worker(&engine, &player.inner, 1, "test_ready", 0,
+            true, &mut last_clock);
+        let request = player.output_drain_request().unwrap();
+        let feedback = player.capture_output_drain_feedback(request, || None).unwrap();
+        assert!(engine.acknowledge_output_drain(request.nonce));
+        player.inner.lock().unwrap().output_drain_feedback = Some(feedback);
+        player.invalidate_audio_clock();
+        let mut published = false;
+        assert!(!publish_natural_eof_from_worker(&mut engine, &player.inner, 1, &mut published));
+        assert_eq!(engine.state(), PlaybackRunState::Playing);
+        assert!(!player.is_ended());
+        let _ = engine.tick().unwrap();
+        sync_playback_clock_from_worker(&engine, &player.inner, 1, "test_reissued", 0,
+            true, &mut last_clock);
+        let replacement = player.output_drain_request().unwrap();
+        assert_ne!(replacement.nonce, request.nonce);
+        let feedback = player.capture_output_drain_feedback(replacement, || None).unwrap();
+        assert!(engine.acknowledge_output_drain(replacement.nonce));
+        player.inner.lock().unwrap().output_drain_feedback = Some(feedback);
+        assert!(publish_natural_eof_from_worker(&mut engine, &player.inner, 1, &mut published));
+        assert!(published);
+        assert!(player.is_ended());
+        assert_eq!(engine.state(), PlaybackRunState::Ended);
+    }
+
+    #[test]
+    fn eof_drain_short_audio_tail_starts_only_for_a_fresh_request() {
+        use crate::audio::{AudioOutputBackend, AudioOutputState, AudioRingBufferConfig, BufferedAudioOutput};
+        use crate::presenter::start_ready_audio_output_for_player;
+        let player = Player::new(PlayerConfig::default());
+        player.inner.lock().unwrap().state = PlayerState::Playing;
+        let format = crate::ffmpeg::PcmFormat::f32_interleaved(48_000, 2);
+        let mut output = BufferedAudioOutput::new(AudioRingBufferConfig::default());
+        output.configure(format).unwrap();
+        output.push(PcmAudioFrame { format, pts: Some(Duration::ZERO), frames: 4_800,
+            samples: vec![0.25; 9_600] }).unwrap();
+        assert!(!start_ready_audio_output_for_player(&mut output, true, false, &player).unwrap());
+        let _ = eof_drain_test_request(&player);
+        assert!(!start_ready_audio_output_for_player(&mut output, false, false, &player).unwrap(),
+            "user pause and enhancement hold still forbid starting");
+        player.invalidate_audio_clock();
+        assert!(!start_ready_audio_output_for_player(&mut output, true, false, &player).unwrap(),
+            "an invalidated request cannot relax startup prefill");
+        let _ = eof_drain_test_request(&player);
+        assert!(start_ready_audio_output_for_player(&mut output, true, false, &player).unwrap());
+        assert_eq!(output.state(), AudioOutputState::Playing);
+        let mut samples = vec![0.0; 9_600];
+        output.read_interleaved(&mut samples).unwrap();
+        assert!(samples.iter().all(|&sample| sample == 0.25));
+        assert_eq!(output.clock_snapshot().queued_frames, 0);
+        assert_eq!(output.clock_snapshot().read_frames, 4_800);
     }
 
     #[test]

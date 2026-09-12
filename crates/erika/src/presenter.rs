@@ -248,6 +248,23 @@ fn start_ready_audio_output(output: &mut dyn AudioOutputBackend, allowed: bool,
     Ok(true)
 }
 
+pub(crate) fn start_ready_audio_output_for_player(output: &mut dyn AudioOutputBackend,
+    allowed: bool, resume_retained_pcm: bool, player: &Player) -> crate::audio::Result<bool> {
+    if !allowed { return Ok(false); }
+    let request = player.output_drain_request();
+    if request.is_none() { return start_ready_audio_output(output, allowed, resume_retained_pcm); }
+    let queued = output.clock_snapshot().and_then(|snapshot| snapshot.queued_duration);
+    // This fence exists only after the decoder has handed off its complete
+    // tail. Recheck it after reading PCM so a reset cannot grant an old tail's
+    // short-prefill exception to the new timeline. User pause removes it too.
+    let eof_tail = request.is_some() && player.output_drain_request() == request;
+    let ready = queued.is_some_and(|queued| queued >= AUDIO_START_BUFFER
+        || ((resume_retained_pcm || eof_tail) && !queued.is_zero()));
+    if !ready { return Ok(false); }
+    output.start()?;
+    Ok(true)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct PresenterRuntimeSnapshot {
     pub stats: PresenterStats,
@@ -318,7 +335,8 @@ pub struct PresenterRuntime {
     enhancement_generation: Option<u64>,
     enhancement_current: Option<AsyncVideoOutput>,
     enhancement_held: bool,
-    enhancement_retry: Option<PlayerVideoFrame>,
+    video_upload_retry: Option<PlayerVideoFrame>,
+    video_upload_refusals: u64,
     enhancement_geometry: (usize, usize),
     enhancement_audio_clock: crate::playback::EnhancementAudioClock,
     enhancement_pause_continuity: Option<AudioClockObservation>,
@@ -695,9 +713,15 @@ impl DanmakuTimeTrace {
 }
 
 impl PresenterRuntime {
-    pub fn new(mut config: PresenterConfig) -> Result<Self> {
+    pub fn new(config: PresenterConfig) -> Result<Self> {
+        let renderer = build_renderer(config.player.renderer, config.renderer)?;
+        let audio_output = build_audio_output(config.audio);
+        Self::with_backends(config, renderer, audio_output)
+    }
+
+    fn with_backends(mut config: PresenterConfig, renderer: Box<dyn RendererBackend>,
+        audio_output: Box<dyn AudioOutputBackend>) -> Result<Self> {
         let renderer_preference = config.player.renderer;
-        let renderer = build_renderer(renderer_preference, config.renderer)?;
         let supports_mediacodec_surface = renderer.supports_mediacodec_surface_frames();
         #[cfg(target_env = "ohos")]
         let ohos_avcodec_surface = renderer.ohos_avcodec_surface();
@@ -712,6 +736,7 @@ impl PresenterRuntime {
         let player = Player::new(config.player);
         let async_video = renderer.uses_async_video_clock();
         player.set_async_video_clock(async_video)?;
+        player.set_output_drain_required(renderer.requires_output_drain())?;
         let video_frames = player.subscribe_video_frames();
         let audio_frames = player.subscribe_audio_frames();
         let subtitle_frames = player.subscribe_subtitle_frames();
@@ -732,14 +757,15 @@ impl PresenterRuntime {
             audio_frames,
             subtitle_frames,
             player_events,
-            audio_output: build_audio_output(config.audio),
+            audio_output,
             audio_configured: false,
             audio_started: false,
             audio_resume_pending: false,
             enhancement_generation: None,
             enhancement_current: None,
             enhancement_held: async_video,
-            enhancement_retry: None,
+            video_upload_retry: None,
+            video_upload_refusals: 0,
             enhancement_geometry: (1, 1),
             enhancement_audio_clock: crate::playback::EnhancementAudioClock::default(),
             enhancement_pause_continuity: None,
@@ -787,6 +813,8 @@ impl PresenterRuntime {
     }
 
     pub fn prepare_shutdown(&mut self) -> bool {
+        self.video_upload_retry = None;
+        self.renderer.cancel_video_upload_retry();
         self.renderer.prepare_shutdown()
     }
 
@@ -807,6 +835,7 @@ impl PresenterRuntime {
     }
 
     pub fn detach_surface(&mut self) -> Result<()> {
+        self.player.invalidate_output_drain()?;
         self.current_surface_metrics = None;
         self.clear_current_danmaku_state();
         self.player.detach_surface()?;
@@ -1581,6 +1610,7 @@ impl PresenterRuntime {
                 return Err(error);
             }
         }
+        self.update_output_drain()?;
 
         self.last_tick_duration = tick_started.elapsed();
         if trace::enabled() {
@@ -1646,7 +1676,7 @@ impl PresenterRuntime {
                 self.player.set_async_video_clock(false)?;
                 self.enhancement_held = false;
                 self.enhancement_current = None;
-                self.enhancement_retry = None;
+                self.video_upload_retry = None;
                 self.enhancement_generation = None;
                 self.enhancement_audio_clock = crate::playback::EnhancementAudioClock::default();
             self.enhancement_pause_continuity = None;
@@ -1663,6 +1693,7 @@ impl PresenterRuntime {
         let audio_started = Instant::now();
         self.pump_audio();
         self.report_audio_output_runtime_stats();
+        self.update_output_drain()?;
         self.last_audio_pump_duration = audio_started.elapsed();
         let sync_started = Instant::now();
         self.sync_media_time_from_player();
@@ -1676,8 +1707,8 @@ impl PresenterRuntime {
         Ok(self.stats)
     }
 
-    fn discard_pending_video_frames(&self) {
-        while self.video_frames.try_recv().is_ok() {}
+    fn discard_pending_video_frames(&mut self) {
+        self.drain_pending_video_frames();
     }
 
     /// Clears the resume bookkeeping across a boundary that replaces or
@@ -1732,7 +1763,7 @@ impl PresenterRuntime {
                 self.enhancement_audio_clock = crate::playback::EnhancementAudioClock::default();
             self.enhancement_pause_continuity = None;
                 self.enhancement_current = None;
-                self.enhancement_retry = None;
+                self.video_upload_retry = None;
                 self.player.set_async_video_clock(true)?;
                 self.set_enhancement_hold(true, None)?;
             }
@@ -1758,7 +1789,7 @@ impl PresenterRuntime {
                     let _ = self.player.set_async_video_clock(false);
                     self.enhancement_held = false;
                     self.enhancement_current = None;
-                    self.enhancement_retry = None;
+                    self.video_upload_retry = None;
                     self.enhancement_generation = None;
                 self.enhancement_audio_clock = crate::playback::EnhancementAudioClock::default();
             self.enhancement_pause_continuity = None;
@@ -2095,6 +2126,37 @@ impl PresenterRuntime {
         })
     }
 
+    fn update_output_drain(&mut self) -> Result<()> {
+        if !self.renderer.requires_output_drain() { return Ok(()); }
+        // Obtain the worker's final-handoff fence before observing downstream
+        // queues. A prior idle sample cannot acknowledge a later final frame.
+        let Some(request) = self.player.output_drain_request() else { return Ok(()); };
+        if self.video_upload_retry.is_some() || !self.video_frames.is_empty()
+            || !self.audio_frames.is_empty() {
+            return Ok(());
+        }
+        if !self.audio_only_tick_active && self.current_surface_metrics.is_some()
+            && self.player.track_selection().video.is_some()
+            && !self.renderer.video_output_drained() {
+            return Ok(());
+        }
+        let feedback = self.player.capture_output_drain_feedback(request, || {
+            self.audio_output.clock_snapshot().or_else(|| {
+                // An unconfigured/no-audio output has no cursor. Its actual
+                // queue counters still prove whether buffered PCM remains.
+                if self.audio_configured && self.player.track_selection().audio.is_some() {
+                    return None;
+                }
+                let stats = self.audio_output.stats();
+                Some(AudioClockSnapshot { media_time: None, queued_duration: None,
+                    queued_frames: stats.queued_frames, read_frames: stats.read_frames,
+                    written_frames: stats.written_frames, underflow_frames: stats.underflow_frames })
+            })
+        });
+        if let Some(feedback) = feedback { self.player.acknowledge_output_drain(feedback)?; }
+        Ok(())
+    }
+
     fn update_enhancement_presentation(&mut self) -> Result<()> {
         if !self.renderer.uses_async_video_clock() || self.audio_only_tick_active { return Ok(()); }
         let ready = self.renderer.poll_async_video_output()?;
@@ -2162,7 +2224,7 @@ impl PresenterRuntime {
             self.enhancement_audio_clock = crate::playback::EnhancementAudioClock::default();
             self.enhancement_pause_continuity = None;
             self.enhancement_current = None;
-            self.enhancement_retry = None;
+            self.video_upload_retry = None;
             // The engine resets its own credit on generation changes. A local
             // hold stops audio even if it was running before the seek.
             self.enhancement_held = false;
@@ -2176,7 +2238,9 @@ impl PresenterRuntime {
             if pumped >= VIDEO_PUMP_FRAME_LIMIT || started.elapsed() >= VIDEO_PUMP_TIME_BUDGET {
                 break;
             }
-            match self.enhancement_retry.take().map_or_else(|| self.video_frames.try_recv(), Ok) {
+            let retry = self.video_upload_retry.take();
+            let retrying = retry.is_some();
+            match retry.map_or_else(|| self.video_frames.try_recv(), Ok) {
                 Ok(frame) => {
                     if frame.generation != self.player.playback_generation() {
                         continue;
@@ -2193,7 +2257,7 @@ impl PresenterRuntime {
                     if should_reject_video_import(self.rejected_video_import_route, import_route) {
                         continue;
                     }
-                    self.stats.decoded_video_frames += 1;
+                    if !retrying { self.stats.decoded_video_frames += 1; }
                     match self.renderer.upload_player_frame(&frame) {
                         Ok(()) => {
                             if self.renderer.uses_async_video_clock() {
@@ -2234,8 +2298,16 @@ impl PresenterRuntime {
                             pumped += 1;
                         }
                         Err(PlayerError::RendererBackpressure(reason)) => {
-                            if self.renderer.uses_async_video_clock() {
-                                self.enhancement_retry = Some(frame);
+                            if self.renderer.retries_video_upload_backpressure() {
+                                self.video_upload_refusals = self.video_upload_refusals.saturating_add(1);
+                                if should_report_video_frame_backpressure(self.video_upload_refusals) {
+                                    trace::diagnostic(serde_json::json!({
+                                        "event": "video_frame_backpressure", "stage": "renderer_upload_retry",
+                                        "generation": frame.generation, "refusalCount": self.video_upload_refusals,
+                                        "action": "retain_current_input_retry_next_tick", "reason": reason,
+                                    }).to_string());
+                                }
+                                self.video_upload_retry = Some(frame);
                                 break;
                             }
                             self.stats.video_frame_backpressure_drops =
@@ -3337,7 +3409,8 @@ impl PresenterRuntime {
     fn ensure_audio_started(&mut self) {
         let allowed = self.is_playing() && !self.enhancement_held
             && !self.audio_started && self.audio_start_allowed();
-        match start_ready_audio_output(self.audio_output.as_mut(), allowed, self.audio_resume_pending) {
+        match start_ready_audio_output_for_player(self.audio_output.as_mut(), allowed,
+            self.audio_resume_pending, &self.player) {
             Ok(true) => {
                 self.audio_started = true;
                 self.audio_resume_pending = false;
@@ -3353,6 +3426,9 @@ impl PresenterRuntime {
 
     fn audio_start_allowed(&self) -> bool {
         self.player.track_selection().video.is_none() || self.stats.rendered_video_frames > 0
+            || (self.renderer.requires_output_drain() && self.player.output_drain_request().is_some()
+                && (self.audio_only_tick_active || self.current_surface_metrics.is_none()
+                    || self.renderer.video_output_drained()))
     }
 
     fn reset_audio_output(&mut self) {
@@ -3421,6 +3497,11 @@ impl PresenterRuntime {
     }
 
     fn drain_pending_video_frames(&mut self) {
+        self.video_upload_retry = None;
+        self.renderer.cancel_video_upload_retry();
+        if let Err(error) = self.player.invalidate_output_drain() {
+            trace::diagnostic(format!("output drain invalidation: {error}"));
+        }
         while self.video_frames.try_recv().is_ok() {}
     }
 }
@@ -4299,6 +4380,139 @@ fn append_text_subtitles_debug(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct VideoUploadProbeState {
+        attempts: Vec<(Duration, usize)>,
+        refuse_next: bool,
+        cancellations: usize,
+    }
+
+    struct VideoUploadProbe {
+        state: Arc<Mutex<VideoUploadProbeState>>,
+        retry: bool,
+    }
+
+    impl RendererBackend for VideoUploadProbe {
+        fn retries_video_upload_backpressure(&self) -> bool { self.retry }
+        fn cancel_video_upload_retry(&mut self) { self.state.lock().unwrap().cancellations += 1; }
+        fn attach_surface(&mut self, _surface: PlatformSurface) -> Result<()> { Ok(()) }
+        fn detach_surface(&mut self) -> Result<()> { Ok(()) }
+        fn resize_surface(&mut self, _metrics: SurfaceMetrics) -> Result<()> { Ok(()) }
+        fn render_test_frame(&mut self, _time: f64) -> Result<()> { Ok(()) }
+        fn render_current_frame(&mut self, _context: RenderFrameContext<'_>) -> Result<bool> { Ok(false) }
+        fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
+            let mut state = self.state.lock().unwrap();
+            state.attempts.push((frame.media_time, frame.frame.decoded_frame().unwrap().as_ptr() as usize));
+            if std::mem::take(&mut state.refuse_next) {
+                Err(PlayerError::RendererBackpressure("test occupied output lease".into()))
+            } else { Ok(()) }
+        }
+    }
+
+    fn video_upload_probe(retry: bool) -> (PresenterRuntime, Arc<Mutex<VideoUploadProbeState>>,
+        Sender<PlayerVideoFrame>) {
+        let state = Arc::new(Mutex::new(VideoUploadProbeState { refuse_next: true, ..Default::default() }));
+        let renderer = Box::new(VideoUploadProbe { state: state.clone(), retry });
+        assert!(!renderer.uses_async_video_clock(), "retry must not enable enhancement clock/holds");
+        let audio = Box::new(crate::audio::BufferedAudioOutput::new(AudioRingBufferConfig::default()));
+        let mut presenter = PresenterRuntime::with_backends(PresenterConfig::default(), renderer, audio).unwrap();
+        let (sender, receiver) = crossbeam_channel::bounded(2);
+        presenter.video_frames = receiver;
+        (presenter, state, sender)
+    }
+
+    fn video_upload_fixture_frames(generation: u64) -> Vec<PlayerVideoFrame> {
+        use crate::ffmpeg::{DecoderOutputFrame, Demuxer, StreamSelection};
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/playback/playback-fixture.mkv");
+        let mut demuxer = Demuxer::open_path(path).unwrap();
+        let stream = demuxer.probe().tracks.iter().find(|track| track.kind == crate::core::TrackKind::Video)
+            .unwrap().id as i32;
+        demuxer.set_stream_selection(StreamSelection::only([stream])).unwrap();
+        // open_decoder uses DecoderConfig::software; no renderer/device is created.
+        let mut decoder = demuxer.open_decoder(stream).unwrap();
+        let mut frames = Vec::new();
+        while frames.len() < 2 {
+            let packet = demuxer.read_packet().unwrap().expect("fixture has two video frames");
+            decoder.send_packet(&packet).unwrap();
+            loop {
+                match decoder.receive_frame().unwrap() {
+                    DecoderOutputFrame::Frame(frame) => {
+                        let pts = Duration::from_secs_f64(frame.pts().unwrap().seconds());
+                        frames.push(PlayerVideoFrame {
+                            frame: crate::renderer::VideoFramePayload::from_decoded(frame).unwrap(),
+                            decode_backend: DecoderBackend::Software, pts: Some(pts), media_time: pts,
+                            late_by: None, generation, enhancement_token: None,
+                        });
+                        if frames.len() == 2 { break; }
+                    }
+                    DecoderOutputFrame::NeedMoreInput | DecoderOutputFrame::EndOfStream => break,
+                }
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn video_upload_bypass_retries_identical_owner_before_next_frame_without_drops() {
+        let (mut presenter, state, sender) = video_upload_probe(true);
+        let frames = video_upload_fixture_frames(presenter.player.playback_generation());
+        let expected = frames.iter().map(|frame| (frame.media_time,
+            frame.frame.decoded_frame().unwrap().as_ptr() as usize)).collect::<Vec<_>>();
+        for frame in frames { sender.send(frame).ok().unwrap(); }
+        presenter.pump_video();
+        assert_eq!(state.lock().unwrap().attempts, vec![expected[0]]);
+        assert!(presenter.video_upload_retry.is_some());
+        assert_eq!(presenter.video_frames.len(), 1, "refusal leaves the next input queued");
+        assert_eq!(presenter.stats.video_frame_backpressure_drops, 0);
+        assert_eq!(presenter.stats.decoded_video_frames, 1);
+        presenter.pump_video();
+        assert_eq!(&state.lock().unwrap().attempts[..2], &[expected[0], expected[0]]);
+        // Overlay preparation can consume the normal 4ms pump budget before
+        // the next queued frame, so permit subsequent bounded CPU ticks.
+        for _ in 0..8 {
+            if presenter.video_frames.is_empty() { break; }
+            presenter.pump_video();
+        }
+        assert_eq!(state.lock().unwrap().attempts, vec![expected[0], expected[0], expected[1]]);
+        assert!(presenter.video_upload_retry.is_none());
+        assert!(presenter.video_frames.is_empty());
+        assert_eq!(presenter.stats.decoded_video_frames, 2, "retry is not a decoded frame");
+        assert_eq!(presenter.video_upload_refusals, 1);
+        assert_eq!(presenter.stats.video_frame_backpressure_drops, 0);
+        assert!(!presenter.enhancement_held);
+
+        state.lock().unwrap().refuse_next = true;
+        for frame in video_upload_fixture_frames(presenter.player.playback_generation()) {
+            sender.send(frame).ok().unwrap();
+        }
+        presenter.pump_video();
+        assert!(presenter.video_upload_retry.is_some());
+        let attempts = state.lock().unwrap().attempts.len();
+        presenter.drain_pending_video_frames();
+        assert!(presenter.video_upload_retry.is_none(), "transition releases the refused owner");
+        assert_eq!(state.lock().unwrap().cancellations, 1, "renderer retry bookkeeping is cancelled too");
+        presenter.pump_video();
+        assert_eq!(state.lock().unwrap().attempts.len(), attempts, "drained inputs cannot retry");
+    }
+
+    #[test]
+    fn video_upload_default_backpressure_keeps_existing_drop_policy() {
+        let default_renderer = CaptureCompositionProbe { captured: Arc::new(Mutex::new(None)) };
+        assert!(!default_renderer.retries_video_upload_backpressure());
+        let (mut presenter, state, sender) = video_upload_probe(false);
+        for frame in video_upload_fixture_frames(presenter.player.playback_generation()) {
+            sender.send(frame).ok().unwrap();
+        }
+        presenter.pump_video();
+        assert!(presenter.video_upload_retry.is_none());
+        assert_eq!(presenter.stats.video_frame_backpressure_drops, 1);
+        assert_eq!(presenter.video_frames.len(), 1);
+        presenter.pump_video();
+        assert_eq!(state.lock().unwrap().attempts.len(), 2, "default policy never retries refused input");
+        assert_eq!(presenter.stats.decoded_video_frames, 2);
+    }
+
 
     #[test]
     fn enhancement_audio_resume_plays_retained_short_tail_and_respects_pause() {

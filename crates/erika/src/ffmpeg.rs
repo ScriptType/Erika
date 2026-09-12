@@ -2366,6 +2366,17 @@ impl Frame {
         })
     }
 
+    /// The decoded frame's declared duration in its decoder time base. Keep
+    /// missing durations unknown; do not infer them from nominal frame rate.
+    pub fn duration(&self) -> Option<PacketTimestamp> {
+        #[cfg(erika_ffmpeg_legacy_frame_duration)]
+        let raw = unsafe { (*self.ptr).pkt_duration };
+        #[cfg(not(erika_ffmpeg_legacy_frame_duration))]
+        let raw = unsafe { (*self.ptr).duration };
+        (raw > 0 && self.time_base.num > 0 && self.time_base.den > 0)
+            .then_some(PacketTimestamp { raw, time_base: self.time_base })
+    }
+
     pub fn color_primaries(&self) -> ColorPrimaries {
         unsafe { color_primaries((*self.ptr).color_primaries) }
     }
@@ -4561,6 +4572,22 @@ mod tests {
     #[test]
     fn linked_ffmpeg_reports_version() {
         assert!(!version().is_empty());
+    }
+
+    #[test]
+    fn eof_drain_frame_duration_preserves_declared_rational_and_rejects_unknown() {
+        let mut frame = Frame::alloc(TimeBase { num: 1, den: 30_000 }).unwrap();
+        for raw in [0, -1, 1_001] {
+            #[cfg(erika_ffmpeg_legacy_frame_duration)]
+            unsafe { (*frame.ptr).pkt_duration = raw; }
+            #[cfg(not(erika_ffmpeg_legacy_frame_duration))]
+            unsafe { (*frame.ptr).duration = raw; }
+            assert_eq!(frame.duration(), (raw > 0).then_some(PacketTimestamp {
+                raw, time_base: TimeBase { num: 1, den: 30_000 },
+            }));
+        }
+        frame.time_base.den = 0;
+        assert!(frame.duration().is_none());
     }
 
     #[test]

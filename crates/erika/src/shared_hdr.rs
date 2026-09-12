@@ -5,7 +5,7 @@ use crate::core::*;
 use crate::renderer::metal::{MetalRenderer, MetalRendererConfig};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[path = "shared_hdr_diagnostics.rs"]
@@ -101,8 +101,10 @@ struct SessionHandle {
     raw: *mut c_void,
     report: Option<CString>,
     generation: AtomicU64,
+    closing: AtomicBool,
     seek_started: AtomicU64,
     unpresented_drawables: AtomicU64,
+    unavailable_drawable_attempts: AtomicU64,
     diagnostics: Option<Mutex<PresentationDiagnostics>>,
 }
 unsafe impl Send for SessionHandle {}
@@ -119,6 +121,8 @@ pub struct EngineOutput {
     clock: AtomicU64,
     clock_rate: AtomicU64,
     presentations: AtomicU64,
+    resolved_presentations: AtomicU64,
+    unavailable_drawable_attempts: AtomicU64,
 }
 impl EngineOutput {
     pub fn presentation_clock(&self) -> f64 {
@@ -145,6 +149,9 @@ impl EngineOutput {
         }
         if stale {
             return;
+        }
+        if callback_resolves_presentation(host) {
+            self.resolved_presentations.fetch_add(1, Ordering::Relaxed);
         }
         // Apple reports zero for drawables that were never displayed or dropped.
         // Keep this separate from real presentations and never fabricate a clock.
@@ -179,7 +186,33 @@ unsafe impl Send for EngineOutput {}
 unsafe impl Sync for EngineOutput {}
 impl Drop for EngineOutput {
     fn drop(&mut self) {
+        // Drawable handlers retain this output until their callbacks retire.
+        // Replacing `current` alone cannot prove that it was never presented.
+        if should_record_output_drop(self.info.generation,
+            self.session.generation.load(Ordering::Relaxed),
+            self.session.closing.load(Ordering::Relaxed),
+            self.presentations.load(Ordering::Relaxed)) {
+            unsafe { erika_hdr_dropped(self.session.raw, self.info.generation, self.info.frame_id) }
+        }
         unsafe { erika_hdr_release(self.lease) }
+    }
+}
+
+fn should_record_output_drop(generation: u64, current_generation: u64, closing: bool,
+    presentations: u64) -> bool {
+    generation == current_generation && !closing && presentations == 0
+}
+
+fn callback_resolves_presentation(host: f64) -> bool { host.is_finite() && host >= 0.0 }
+
+fn video_output_has_drained(latest: Option<(u64, u64)>, current: Option<(u64, u64, u64, u64)>,
+    generation: u64, pending: bool) -> bool {
+    !pending && match latest {
+        None => current.is_none(),
+        Some(identity) => current.is_some_and(|(output_generation, id, resolved, unavailable)| {
+            identity == (output_generation, id) && output_generation == generation
+                && (resolved > 0 || unavailable > 0)
+        }),
     }
 }
 
@@ -199,6 +232,11 @@ pub struct SharedHDRRenderer {
     capture: Option<CString>,
     captured_generation: Option<u64>,
     admission_drops: u64,
+    admission_refusals: u64,
+    admission_retries: u64,
+    admission_cancelled_retries: u64,
+    admission_retry_pending: bool,
+    latest_accepted: Option<(u64, u64)>,
     stale_outputs: u64,
     decoded_frames: u64,
     display_size: (u32, u32),
@@ -281,8 +319,10 @@ impl SharedHDRRenderer {
                 raw: session,
                 report,
                 generation: AtomicU64::new(engine_generation),
+                closing: AtomicBool::new(false),
                 seek_started: AtomicU64::new(0),
                 unpresented_drawables: AtomicU64::new(0),
+                unavailable_drawable_attempts: AtomicU64::new(0),
                 diagnostics: (std::env::var("ERIKA_ADAPTER_DIAGNOSTICS").as_deref() == Ok("1"))
                     .then(|| Mutex::new(PresentationDiagnostics::default())),
             }),
@@ -299,6 +339,11 @@ impl SharedHDRRenderer {
             capture,
             captured_generation: None,
             admission_drops: 0,
+            admission_refusals: 0,
+            admission_retries: 0,
+            admission_cancelled_retries: 0,
+            admission_retry_pending: false,
+            latest_accepted: None,
             stale_outputs: 0,
             decoded_frames: 0,
             display_size: (0, 0),
@@ -321,6 +366,7 @@ impl SharedHDRRenderer {
         }
     }
     fn reset(&mut self) -> Result<()> {
+        self.cancel_video_upload_retry();
         self.engine_generation = unsafe { erika_hdr_reset(self.session.raw) };
         self.session
             .generation
@@ -334,6 +380,7 @@ impl SharedHDRRenderer {
         self.ready = None;
         self.pending_token = None;
         self.frame_id = 0;
+        self.latest_accepted = None;
         self.inner.clear_current_frame()
     }
     fn poll(&mut self) -> Result<()> {
@@ -351,6 +398,8 @@ impl SharedHDRRenderer {
                 clock: AtomicU64::new(f64::NAN.to_bits()),
                 clock_rate: AtomicU64::new(0.0_f64.to_bits()),
                 presentations: AtomicU64::new(0),
+                resolved_presentations: AtomicU64::new(0),
+                unavailable_drawable_attempts: AtomicU64::new(0),
             });
             if info.generation != self.engine_generation {
                 self.stale_outputs += 1;
@@ -365,17 +414,6 @@ impl SharedHDRRenderer {
             if self.async_video {
                 self.ready = Some(output);
                 break;
-            }
-            if let Some(previous) = &self.current {
-                if previous.presentations.load(Ordering::Relaxed) == 0 {
-                    unsafe {
-                        erika_hdr_dropped(
-                            self.session.raw,
-                            previous.info.generation,
-                            previous.info.frame_id,
-                        )
-                    }
-                }
             }
             self.inner
                 .upload_shared_hdr(output.clone(), self.playback_generation.unwrap_or(1))?;
@@ -395,19 +433,28 @@ impl SharedHDRRenderer {
 }
 impl Drop for SharedHDRRenderer {
     fn drop(&mut self) {
+        self.session.closing.store(true, Ordering::Relaxed);
+        self.cancel_video_upload_retry();
         unsafe {
             eprintln!(
-                "Erika adapter admission: decoded={} rejected_full={} stale_completions={} display={}x{}",
+                "Erika adapter admission: decoded={} dropped={} refused_full={} retried={} stale_completions={} display={}x{}",
                 self.decoded_frames,
                 self.admission_drops,
+                self.admission_refusals,
+                self.admission_retries,
                 self.stale_outputs,
                 self.display_size.0,
                 self.display_size.1
             );
             if let Some(path) = &self.session.report {
-                let diagnostics = serde_json::json!({"decodedFrames":self.decoded_frames,"admissionDrops":self.admission_drops,"staleCompletions":self.stale_outputs,
+                let diagnostics = serde_json::json!({"decodedFrames":self.decoded_frames,"admissionDrops":self.admission_drops,
+                "admissionRefusals":self.admission_refusals,"admissionRetries":self.admission_retries,"staleCompletions":self.stale_outputs,
+                "admissionCancelledRetries":self.admission_cancelled_retries,
+                "admissionScope":"decodedFrames counts distinct inputs, refusals count FE_FULL attempts, retries count refused inputs subsequently accepted; reset/shutdown can cancel a retained retry without an admission drop",
                 "displayWidth":self.display_size.0,"displayHeight":self.display_size.1,
                 "unpresentedDrawableCallbacks":self.session.unpresented_drawables.load(Ordering::Relaxed),
+                "unavailableDrawableAttempts":self.session.unavailable_drawable_attempts.load(Ordering::Relaxed),
+                "outputDrainScope":"latest accepted output completed and has a resolved drawable callback or observed unavailable drawable acquisition; zero callbacks and unavailable attempts do not certify visible presentation",
                 "presentationDiagnostics":self.session.diagnostics.as_ref().map(|v| serde_json::to_value(&*v.lock().unwrap()).unwrap()),
                 "displayHeadroomRange":self.headroom_range,"renderer":format!("{:?}",self.inner.runtime_stats()),
                 "clockMeasurement":"audio callback media time sampled before encode, extrapolated to CAMetalDrawable presentedTime at the sampled running playback rate or zero while held; later transport changes are not reconstructed; unavailable without audio",
@@ -430,6 +477,18 @@ impl Drop for SharedHDRRenderer {
 }
 impl RendererBackend for SharedHDRRenderer {
     fn uses_async_video_clock(&self) -> bool { self.async_video }
+    fn retries_video_upload_backpressure(&self) -> bool { true }
+    fn cancel_video_upload_retry(&mut self) {
+        if std::mem::take(&mut self.admission_retry_pending) { self.admission_cancelled_retries += 1; }
+    }
+    fn requires_output_drain(&self) -> bool { true }
+    fn video_output_drained(&self) -> bool {
+        video_output_has_drained(self.latest_accepted, self.current.as_ref().map(|output| {
+            (output.info.generation, output.info.frame_id, output.resolved_presentations.load(Ordering::Relaxed),
+                output.unavailable_drawable_attempts.load(Ordering::Relaxed))
+        }), self.engine_generation,
+            self.admission_retry_pending || self.ready.is_some() || self.pending_token.is_some())
+    }
 
     fn poll_async_video_output(&mut self) -> Result<Option<AsyncVideoOutput>> {
         if !self.async_video { return Ok(None); }
@@ -473,6 +532,8 @@ impl RendererBackend for SharedHDRRenderer {
     fn prepare_shutdown(&mut self) -> bool {
         if !self.shutting_down {
             self.shutting_down = true;
+            self.session.closing.store(true, Ordering::Relaxed);
+            self.cancel_video_upload_retry();
             self.current = None;
             self.ready = None;
             self.pending_token = None;
@@ -522,12 +583,15 @@ impl RendererBackend for SharedHDRRenderer {
         let pts = decoded
             .pts()
             .ok_or_else(|| PlayerError::Renderer("shared HDR input has no rational PTS".into()))?;
-        self.decoded_frames += 1;
+        if !self.admission_retry_pending { self.decoded_frames += 1; }
         if self.async_video && (frame.enhancement_token.is_none() || self.pending_token.is_some()) {
             return Err(PlayerError::Renderer("missing or duplicate asynchronous video credit".into()));
         }
         let id = self.frame_id;
-        if !self.async_video { self.frame_id = self.frame_id.wrapping_add(1); }
+        // Reclaim completed bypass outputs before another admission attempt.
+        // FE_FULL can still occur while Metal retains an output, so the
+        // presenter also preserves the refused input for the next tick.
+        if !self.async_video { self.poll()?; }
         let status = unsafe {
             erika_hdr_submit(
                 self.session.raw,
@@ -540,11 +604,21 @@ impl RendererBackend for SharedHDRRenderer {
             )
         };
         match status {
-            0=>{if self.async_video {
-                self.pending_token = Some((id, frame.enhancement_token.expect("validated credit")));
+            0=>{
+                if self.admission_retry_pending { self.admission_retries += 1; }
+                self.admission_retry_pending = false;
+                self.latest_accepted = Some((self.engine_generation, id));
+                if self.async_video {
+                    self.pending_token = Some((id, frame.enhancement_token.expect("validated credit")));
+                }
                 self.frame_id = self.frame_id.wrapping_add(1);
-            } Ok(())},
-            1=>{if !self.async_video {self.admission_drops+=1;unsafe{erika_hdr_dropped(self.session.raw,self.engine_generation,id)}};Err(PlayerError::RendererBackpressure("shared HDR engine full (three retained slots)".into()))},
+                Ok(())
+            },
+            1=>{
+                self.admission_refusals += 1;
+                self.admission_retry_pending = true;
+                Err(PlayerError::RendererBackpressure("shared HDR engine full (three retained slots)".into()))
+            },
             2|5 if !self.async_video=>Ok(()),
             _=>Err(PlayerError::Renderer("shared HDR rejected frame metadata/ownership; inspect source colour tags and rational duration".into()))
         }
@@ -571,7 +645,16 @@ impl RendererBackend for SharedHDRRenderer {
             Ordering::Relaxed,
         );
         output.clock_rate.store(self.clock_rate.to_bits(), Ordering::Relaxed);
-        self.inner.render_current_frame(context)
+        let skips = self.inner.present_backpressure_skips();
+        let result = self.inner.render_current_frame(context);
+        if self.inner.present_backpressure_skips() > skips {
+            // This output completed processing and acquisition of its native
+            // drawable/external texture target was unavailable. This is not a callback or a
+            // positive presentation, but it must not hold hidden playback at EOF.
+            output.unavailable_drawable_attempts.fetch_add(1, Ordering::Relaxed);
+            self.session.unavailable_drawable_attempts.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
     fn clear_current_frame(&mut self) -> Result<()> {
         self.reset()
@@ -613,6 +696,33 @@ impl RendererBackend for SharedHDRRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn eof_drain_requires_latest_resolved_drawable_and_no_pending_upload() {
+        assert!(!video_output_has_drained(Some((6, 7)), Some((6, 6, 4, 0)), 6, false));
+        assert!(!video_output_has_drained(Some((6, 7)), Some((6, 7, 0, 0)), 6, false));
+        assert!(video_output_has_drained(Some((6, 7)), Some((6, 7, 1, 0)), 6, false));
+        assert!(!video_output_has_drained(Some((6, 7)), Some((6, 7, 1, 0)), 6, true));
+        assert!(!video_output_has_drained(Some((6, 7)), Some((6, 7, 1, 0)), 7, false));
+        assert!(video_output_has_drained(Some((6, 7)), Some((6, 7, 0, 1)), 6, false));
+        assert!(!video_output_has_drained(Some((6, 7)), Some((6, 6, 0, 1)), 6, false),
+            "an earlier unavailable attempt cannot drain an uncompleted latest upload");
+        assert!(!video_output_has_drained(Some((6, 7)), Some((6, 7, 0, 1)), 7, false));
+        assert!(video_output_has_drained(None, None, 7, false), "an empty seek can drain");
+        assert!(!video_output_has_drained(None, None, 7, true));
+        assert!(callback_resolves_presentation(12.5));
+        assert!(callback_resolves_presentation(0.0), "occlusion can resolve without visible presentation");
+        assert!(!callback_resolves_presentation(f64::NAN));
+        assert!(!callback_resolves_presentation(-1.0));
+    }
+
+    #[test]
+    fn video_upload_drop_waits_for_callbacks_and_excludes_cancelled_outputs() {
+        assert!(should_record_output_drop(6, 6, false, 0));
+        assert!(!should_record_output_drop(6, 6, false, 1), "a late positive callback wins before final owner release");
+        assert!(!should_record_output_drop(6, 7, false, 0), "seek cancellation is not a drop");
+        assert!(!should_record_output_drop(6, 6, true, 0), "closing cancellation is not a drop");
+    }
+
     #[test]
     fn crop_and_non_square_pixels_rotate_into_display_geometry() {
         let info = OutputInfo {

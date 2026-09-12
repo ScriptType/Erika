@@ -210,6 +210,7 @@ fn android_glslc() -> PathBuf {
 
 fn emit_ffmpeg_version_cfg() -> Option<u32> {
     println!("cargo:rustc-check-cfg=cfg(erika_ffmpeg_legacy_channel_layout)");
+    println!("cargo:rustc-check-cfg=cfg(erika_ffmpeg_legacy_frame_duration)");
     let version_header = ffmpeg_dist_dir().join("include/libavutil/version.h");
     println!("cargo:rerun-if-changed={}", version_header.display());
     let Ok(contents) = fs::read_to_string(&version_header) else {
@@ -226,6 +227,9 @@ fn emit_ffmpeg_version_cfg() -> Option<u32> {
     });
     if matches!(major, Some(value) if value < 57) {
         println!("cargo:rustc-cfg=erika_ffmpeg_legacy_channel_layout");
+    }
+    if matches!(major, Some(value) if value < 58) {
+        println!("cargo:rustc-cfg=erika_ffmpeg_legacy_frame_duration");
     }
     major
 }

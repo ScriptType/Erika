@@ -4196,6 +4196,12 @@ pub struct VideoPlaybackEngine {
     enhancement_audio_clock: EnhancementAudioClock,
     enhancement_audio_unavailable: bool,
     enhancement_audio_unavailable_cursor: Option<(u64, u64)>,
+    output_drain_required: bool,
+    output_drain_epoch: u64,
+    output_drain_serial: u64,
+    output_drain_request: Option<u64>,
+    output_drain_acknowledged: bool,
+    last_video_output_end: Option<Duration>,
 }
 
 impl VideoPlaybackEngine {
@@ -4323,6 +4329,12 @@ impl VideoPlaybackEngine {
             enhancement_audio_clock: EnhancementAudioClock::default(),
             enhancement_audio_unavailable: false,
             enhancement_audio_unavailable_cursor: None,
+            output_drain_required: false,
+            output_drain_epoch: 0,
+            output_drain_serial: 0,
+            output_drain_request: None,
+            output_drain_acknowledged: false,
+            last_video_output_end: None,
         }
     }
 
@@ -4582,6 +4594,68 @@ impl VideoPlaybackEngine {
 
     pub(crate) fn uses_async_video_clock(&self) -> bool { self.async_video }
 
+    pub(crate) fn set_output_drain_required(&mut self, required: bool, epoch: u64) {
+        self.output_drain_required = required;
+        self.invalidate_output_drain(epoch);
+    }
+
+    pub(crate) fn invalidate_output_drain(&mut self, epoch: u64) {
+        self.output_drain_epoch = epoch;
+        self.output_drain_request = None;
+        self.output_drain_acknowledged = false;
+    }
+
+    pub(crate) fn output_drain_epoch(&self) -> u64 { self.output_drain_epoch }
+
+    pub(crate) fn requires_output_drain(&self) -> bool { self.output_drain_required }
+
+    pub(crate) fn video_decode_is_suspended(&self) -> bool { self.session.video_decode_suspended }
+
+    pub(crate) fn pending_output_drain(&self) -> Option<u64> {
+        self.output_drain_required.then_some(self.output_drain_request).flatten()
+    }
+
+    pub(crate) fn output_drain_ready_to_commit(&self) -> Option<u64> {
+        self.pending_output_drain().filter(|_| self.output_drain_acknowledged)
+    }
+
+    pub(crate) fn acknowledge_output_drain(&mut self, nonce: u64) -> bool {
+        if !self.output_drain_required || self.output_drain_request != Some(nonce) {
+            return false;
+        }
+        self.output_drain_acknowledged = true;
+        true
+    }
+
+    pub(crate) fn record_video_output_end(&mut self, end: Option<Duration>) {
+        self.last_video_output_end = end;
+    }
+
+    /// Called while the player publication lock still protects the accepted
+    /// output identity. Decoder ticks cannot commit an opted-in EOF themselves.
+    pub(crate) fn commit_output_drain(&mut self, nonce: u64) -> bool {
+        if self.state != PlaybackRunState::Playing || self.output_drain_ready_to_commit() != Some(nonce) {
+            return false;
+        }
+        self.finish_eof(Instant::now());
+        self.output_drain_request = None;
+        self.output_drain_acknowledged = false;
+        true
+    }
+
+    fn finish_eof(&mut self, now: Instant) {
+        self.eof = true;
+        self.state = PlaybackRunState::Ended;
+        self.buffering = false;
+        self.buffering_video_pts = None;
+        self.last_buffering_video_drain_at = None;
+        self.buffering_video_drained_frames = 0;
+        let media_time = self.info().duration.unwrap_or_else(|| self.media_time_at(now));
+        let before = self.clock.media_time_at(now);
+        self.clock.reset(media_time, false, now);
+        trace_clock_reset("eof", before, media_time, self.state);
+    }
+
     pub(crate) fn pending_enhancement_token(&self) -> Option<u64> { self.enhancement_pending }
 
     pub(crate) fn async_video_eof(&self) -> bool {
@@ -4600,6 +4674,8 @@ impl VideoPlaybackEngine {
     }
 
     fn reset_enhancement_credit(&mut self) {
+        self.invalidate_output_drain(self.output_drain_epoch);
+        self.last_video_output_end = None;
         let was_active = self.async_video || self.enhancement_held || self.enhancement_pending.is_some();
         self.enhancement_pending = None;
         self.enhancement_final_end = None;
@@ -5486,11 +5562,11 @@ impl VideoPlaybackEngine {
             self.ensure_pending_frame_with_now(&mut now)?;
             let Some(frame) = self.pending_frame.as_ref() else {
                 // A paused seek past the last frame never produces the preview
-                // frame that would clear the flag. Give it up at EOF so the
+                // frame that would clear the flag. Give it up at decoder EOF so the
                 // worker can fall back to its idle poll interval instead of
                 // spinning at the 2 ms paused-preview rate until playback
                 // resumes.
-                if paused_seek_preview && self.eof {
+                if paused_seek_preview && (self.eof || self.pending_output_drain().is_some()) {
                     self.paused_seek_frame_pending = false;
                     trace::log(format!(
                         "[erika-playback-trace] stage=paused_seek_frame_abandoned reason=eof target={}",
@@ -5765,20 +5841,21 @@ impl VideoPlaybackEngine {
                 // activated frame interval and already handed-off PCM timeline.
                 return Ok(());
             }
-            self.eof = true;
-            self.state = PlaybackRunState::Ended;
-            self.buffering = false;
-            self.buffering_video_pts = None;
-            self.last_buffering_video_drain_at = None;
-            self.buffering_video_drained_frames = 0;
-            let eof_now = now();
-            let media_time = self
-                .info()
-                .duration
-                .unwrap_or_else(|| self.media_time_at(now()));
-            let before = self.clock.media_time_at(eof_now);
-            self.clock.reset(media_time, false, eof_now);
-            trace_clock_reset("eof", before, media_time, self.state);
+            if self.output_drain_required && !self.async_video
+                && self.last_video_output_end.is_some_and(|end| self.media_time_at(now()) < end) {
+                return Ok(());
+            }
+            if self.output_drain_required && !self.output_drain_acknowledged {
+                if self.output_drain_request.is_none() {
+                    self.output_drain_serial = self.output_drain_serial.wrapping_add(1).max(1);
+                    self.output_drain_request = Some(self.output_drain_serial);
+                }
+                // Decoder EOF only establishes that no further frames will be
+                // handed off. The output owner must still drain its channels,
+                // asynchronous renderer, and actual PCM queue for this nonce.
+                return Ok(());
+            }
+            if !self.output_drain_required { self.finish_eof(now()); }
         }
         Ok(())
     }
@@ -8182,7 +8259,7 @@ mod tests {
         let mut engine = playback_fixture_engine();
         engine.set_async_video_clock(true);
         let now = Instant::now(); engine.play_at(now);
-        engine.seek_at(Duration::from_millis(730), now);
+        engine.seek_at(Duration::from_millis(730), now).unwrap();
         let first = next_fixture_video_at(&mut engine, now);
         let token = engine.pending_enhancement_token().unwrap();
         assert_eq!(first.pts, Some(Duration::from_millis(733)));
@@ -8377,6 +8454,98 @@ mod tests {
         assert!(engine.enhancement_final_end.is_some());
         let _ = engine.tick_at(t0 + last_end + Duration::from_secs(1)).unwrap();
         assert_eq!(engine.state(), PlaybackRunState::Ended);
+    }
+
+    fn eof_drain_fixture_request(engine: &mut VideoPlaybackEngine) -> (Instant, u64) {
+        engine.set_audio_output_active(false);
+        engine.set_output_drain_required(true, 1);
+        engine.seek(Duration::from_secs(9)).unwrap();
+        let now = Instant::now();
+        engine.play_at(now);
+        let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+        while engine.pending_output_drain().is_none() {
+            let _ = engine.tick_at(now).unwrap();
+            assert!(Instant::now() < deadline, "decoder did not reach drain fence");
+            thread::yield_now();
+        }
+        (now, engine.pending_output_drain().unwrap())
+    }
+
+    #[test]
+    fn eof_drain_bypass_waits_for_matching_output_acknowledgement() {
+        let mut engine = playback_fixture_engine();
+        let (now, request) = eof_drain_fixture_request(&mut engine);
+        assert!(!engine.uses_async_video_clock());
+        assert_eq!(engine.state(), PlaybackRunState::Playing);
+        assert!(engine.tick_at(now + Duration::from_secs(20)).unwrap().is_none());
+        assert_eq!(engine.state(), PlaybackRunState::Playing);
+        assert!(!engine.acknowledge_output_drain(request + 1));
+        assert!(engine.acknowledge_output_drain(request));
+        let _ = engine.tick_at(now + Duration::from_secs(20)).unwrap();
+        assert_eq!(engine.state(), PlaybackRunState::Playing, "tick cannot commit without the publication lock");
+        assert!(engine.commit_output_drain(request));
+        assert_eq!(engine.state(), PlaybackRunState::Ended);
+        assert_eq!(engine.media_time_at(now + Duration::from_secs(40)), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn eof_drain_invalidation_seek_and_stop_reject_previous_acknowledgement() {
+        let mut engine = playback_fixture_engine();
+        let (now, first) = eof_drain_fixture_request(&mut engine);
+        engine.invalidate_output_drain(2);
+        assert!(!engine.acknowledge_output_drain(first));
+        let _ = engine.tick_at(now).unwrap();
+        let second = engine.pending_output_drain().unwrap();
+        assert_ne!(second, first);
+        engine.seek_at(Duration::ZERO, now).unwrap();
+        assert!(engine.pending_output_drain().is_none());
+        assert!(!engine.acknowledge_output_drain(second));
+        engine.stop_checked_at(now).unwrap();
+        assert!(!engine.acknowledge_output_drain(second));
+        assert_eq!(engine.state(), PlaybackRunState::Stopped);
+    }
+
+    #[test]
+    fn eof_drain_video_only_waits_for_known_final_frame_interval() {
+        let mut engine = playback_fixture_engine();
+        let (now, first) = eof_drain_fixture_request(&mut engine);
+        engine.invalidate_output_drain(2);
+        engine.clock.play(now);
+        let end = engine.media_time_at(now) + Duration::from_millis(40);
+        engine.record_video_output_end(Some(end));
+        assert!(!engine.acknowledge_output_drain(first));
+        let _ = engine.tick_at(now + Duration::from_millis(20)).unwrap();
+        assert!(engine.pending_output_drain().is_none(), "the final interval is still active");
+        let _ = engine.tick_at(now + Duration::from_millis(40)).unwrap();
+        let request = engine.pending_output_drain().unwrap();
+        assert!(engine.acknowledge_output_drain(request));
+        let _ = engine.tick_at(now + Duration::from_millis(40)).unwrap();
+        assert!(engine.commit_output_drain(request));
+        assert_eq!(engine.state(), PlaybackRunState::Ended);
+    }
+
+    #[test]
+    fn eof_drain_paused_seek_beyond_last_frame_parks_without_preview_polling() {
+        let mut engine = playback_fixture_engine();
+        engine.set_audio_output_active(false);
+        engine.set_output_drain_required(true, 1);
+        let now = Instant::now();
+        let target = Duration::from_secs(9);
+        engine.seek_at(target, now).unwrap();
+        assert_eq!(engine.state(), PlaybackRunState::Paused);
+        assert!(engine.has_pending_paused_seek_frame());
+        let deadline = Instant::now() + FIXTURE_WAIT_TIMEOUT;
+        while engine.has_pending_paused_seek_frame() {
+            assert!(engine.tick_at(now).unwrap().is_none());
+            assert!(Instant::now() < deadline, "impossible preview must stop fast polling");
+            thread::yield_now();
+        }
+        assert!(engine.pending_output_drain().is_some());
+        assert_eq!(engine.state(), PlaybackRunState::Paused);
+        assert_eq!(engine.media_time_at(now + Duration::from_secs(60)), target);
+        assert!(engine.tick_at(now + Duration::from_secs(60)).unwrap().is_none());
+        assert!(!engine.clock.is_running());
+        assert!(!engine.eof, "user pause is preserved until an explicit resume");
     }
 
     #[test]
