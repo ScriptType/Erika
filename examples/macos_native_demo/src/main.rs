@@ -232,14 +232,17 @@ impl DemoState {
             || self.adapter_last_snapshot.is_some_and(|last| elapsed - last < 0.1) { return; }
         self.adapter_last_snapshot = Some(elapsed);
         self.adapter_snapshots += 1;
-        let snapshot = self.presenter.player().playback_snapshot();
+        let status = self.presenter.player().playback_status_snapshot();
+        let snapshot = &status.playback;
+        let media_seconds = snapshot.media_time().as_secs_f64();
         let runtime = self.presenter.runtime_snapshot();
         adapter_log(serde_json::json!({"event":"snapshot", "demoElapsedSeconds":elapsed,
-            "sample":self.adapter_snapshots, "mediaSeconds":snapshot.media_time().as_secs_f64(),
+            "sample":self.adapter_snapshots, "mediaSeconds":media_seconds,
             "isPlaying":snapshot.is_playing(), "generation":snapshot.generation,
             "clockRunning":snapshot.clock.is_running(),
-            "durationSeconds":self.presenter.duration().map(|v| v.as_secs_f64()),
-            "eof":self.presenter.player().is_stopped_at_end(),
+            "durationSeconds":status.duration.map(|v| v.as_secs_f64()),
+            "eof":status.stopped_at_end,
+            "playbackSnapshotScope":"clock, generation, state, duration and natural EOF captured under one player lock; media time evaluated before separately sampled audio counters; hostSeconds is record emission",
             "audio":{"readFrames":runtime.audio_output_read_frames,
                 "writtenFrames":runtime.audio_output_written_frames,
                 "queuedFrames":runtime.audio_output_queued_frames,

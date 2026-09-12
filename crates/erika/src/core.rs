@@ -139,6 +139,14 @@ pub struct PlaybackSnapshot {
 }
 
 impl PlaybackSnapshot {
+    fn from_inner(inner: &PlayerInner) -> Self {
+        Self {
+            clock: inner.playback_clock.clone(),
+            generation: inner.playback_generation.max(1),
+            state: inner.state,
+        }
+    }
+
     pub fn media_time(&self) -> Duration {
         self.clock.media_time_at(Instant::now())
     }
@@ -150,6 +158,16 @@ impl PlaybackSnapshot {
     pub fn is_playing(&self) -> bool {
         self.state == PlayerState::Playing
     }
+}
+
+/// Playback clock/state, duration and natural EOF captured under one player
+/// lock. This additive wrapper preserves existing `PlaybackSnapshot` literals.
+/// Device audio counters are sampled separately by their output owner.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaybackStatusSnapshot {
+    pub playback: PlaybackSnapshot,
+    pub duration: Option<Duration>,
+    pub stopped_at_end: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1342,10 +1360,18 @@ impl Player {
     /// carrying the still-advancing media time of the previous frame).
     pub fn playback_snapshot(&self) -> PlaybackSnapshot {
         let inner = self.inner.lock().expect("player mutex poisoned");
-        PlaybackSnapshot {
-            clock: inner.playback_clock.clone(),
-            generation: inner.playback_generation.max(1),
-            state: inner.state,
+        PlaybackSnapshot::from_inner(&inner)
+    }
+
+    /// Capture related playback status without combining getters from opposite
+    /// sides of an EOF, seek or source transition. The clock can still be
+    /// evaluated once at the consumer's chosen sampling time.
+    pub fn playback_status_snapshot(&self) -> PlaybackStatusSnapshot {
+        let inner = self.inner.lock().expect("player mutex poisoned");
+        PlaybackStatusSnapshot {
+            playback: PlaybackSnapshot::from_inner(&inner),
+            duration: inner.duration,
+            stopped_at_end: inner.state == PlayerState::Stopped && inner.ended,
         }
     }
 
@@ -4597,6 +4623,83 @@ mod tests {
         assert_eq!(
             snapshot.media_time_at(anchor + Duration::from_secs(60)),
             snapshot.media_time()
+        );
+    }
+
+    #[test]
+    fn eof_drain_playback_status_snapshot_remains_coherent_across_eof() {
+        let player = Player::new(PlayerConfig::default());
+        let anchor = Instant::now();
+        let final_position = Duration::from_secs(60);
+        {
+            let mut inner = player.inner.lock().unwrap();
+            inner.state = PlayerState::Playing;
+            inner.playback_generation = 4;
+            inner.duration = Some(final_position);
+            inner.playback_clock =
+                PlaybackClock::running_at(Duration::from_millis(59_967), anchor);
+        }
+        let before = player.playback_status_snapshot();
+        // Existing downstream struct literals retain their three-field shape.
+        let legacy = PlaybackSnapshot {
+            clock: before.playback.clock.clone(),
+            generation: 4,
+            state: PlayerState::Playing,
+        };
+        assert_eq!(before.playback, legacy);
+        let mut published = false;
+        publish_natural_eof_events_from_worker(
+            &player.inner,
+            4,
+            final_position,
+            &mut published,
+        );
+        assert!(published);
+        assert!(
+            player.is_stopped_at_end(),
+            "a later independent getter now observes EOF"
+        );
+
+        // The retained observation must remain entirely before EOF even when
+        // the live player has crossed the publication boundary.
+        assert!(!before.stopped_at_end);
+        assert!(before.playback.is_playing());
+        assert!(before.playback.clock.is_running());
+        assert_eq!(
+            before.playback.media_time_at(anchor),
+            Duration::from_millis(59_967)
+        );
+        assert_eq!(before.duration, Some(final_position));
+
+        let after = player.playback_status_snapshot();
+        assert!(after.stopped_at_end);
+        assert!(!after.playback.is_playing());
+        assert!(!after.playback.clock.is_running());
+        assert_eq!(
+            after
+                .playback
+                .media_time_at(anchor + Duration::from_secs(100)),
+            final_position
+        );
+        assert_eq!(after.playback.generation, 4);
+        assert_eq!(after.duration, Some(final_position));
+
+        {
+            let mut inner = player.inner.lock().unwrap();
+            inner.ended = false; // A user stop is not natural EOF.
+            inner.duration = None;
+            inner.playback_generation = 5;
+            inner.playback_clock = PlaybackClock::paused_at(Duration::ZERO);
+        }
+        let stopped = player.playback_status_snapshot();
+        assert!(!stopped.stopped_at_end);
+        assert_eq!(stopped.duration, None);
+        assert_eq!(stopped.playback.generation, 5);
+        assert!(after.stopped_at_end);
+        assert_eq!(
+            after.duration,
+            Some(final_position),
+            "later metadata cannot alter a captured observation"
         );
     }
 
